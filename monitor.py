@@ -64,6 +64,11 @@ STATUS_POLL_SEC = 1200           # how often to hit AeroDataBox per flight (20 m
 DELAY_ALERT_MIN = 15             # only alert departure delays >= this many minutes
 DELAY_REALERT_MIN = 15           # re-alert when the delay changes by >= this many minutes
 ARR_DELAY_ALERT_MIN = 20         # only alert arrival delays >= this many minutes
+
+# Proactive "how's the trip going" updates while airborne (no question needed).
+PROGRESS_FRACTIONS = [0.25, 0.50, 0.75]  # send an en-route update at these points of the flight
+PROGRESS_MIN_DURATION_MIN = 180          # only send milestone updates for flights >= 3h
+APPROACH_BEFORE_ARR_MIN = 45             # send an "on approach / descending" update this long before ETA
 # ---------------------------------------------------------------------------
 
 
@@ -355,7 +360,13 @@ def process_status(fl, st, home_tz, now):
             log(f"   >> TERMINAL change alert sent for {fl['number']}")
         s["terminal"] = info["dep_terminal"]
 
+    # Share latest ETA + status text so the progress updates can use them.
     s["baseline"] = True
+    s["status_text"] = info["status"]
+    eta = info["arr_revised"] or info["arr_sched"]
+    s["eta_utc"] = eta.isoformat() if eta else None
+    if info["arr_revised"] and info["arr_sched"]:
+        s["arr_delta_min"] = round((info["arr_revised"] - info["arr_sched"]).total_seconds() / 60)
     log(f"   {fl['number']}: status='{info['status']}' gate={info['dep_gate']} term={info['dep_terminal']}")
     save_state(st)
 
@@ -412,12 +423,15 @@ def process_flight(api, fl, st, home_tz, now):
             if s["phase"] == "WAITING" and not s["departed_alert"]:
                 s["phase"] = "AIRBORNE"
                 s["departed_alert"] = True
+                s["departed_utc"] = now.isoformat()
                 notify(f"{header}\n\n🛫 <b>DEPARTED</b> {fl['origin_name']}\n"
                        f"Now airborne toward {fl['dest_name']}.\n"
                        f"Altitude {alt:,} ft · {spd} kt\n"
                        f"Time: {local_and_home(now, fl['origin_tz'], home_tz)}\n"
                        f"Scheduled arrival: {local_and_home(fl['_arr_utc'], fl['dest_tz'], home_tz)}")
                 log(f"   >> DEPARTURE alert sent for {fl['number']}")
+            # Proactive "how's the trip going" updates while en route.
+            process_progress(fl, s, st, header, home_tz, now, alt, spd)
         elif on_ground and s["seen_airborne"]:
             _fire_landing(fl, s, header, home_tz, now, "on-ground at destination")
     else:
@@ -428,6 +442,69 @@ def process_flight(api, fl, st, home_tz, now):
                 _fire_landing(fl, s, header, home_tz, now, "dropped off radar after flight")
         else:
             log(f"   {fl['number']}: not airborne yet / not in feed")
+
+
+def _eta_and_note(fl, st):
+    """Best-known arrival ETA (UTC) and an on-schedule note, using AeroDataBox if present."""
+    ss = st.get(fl["id"] + "#status", {})
+    eta = None
+    if ss.get("eta_utc"):
+        try:
+            eta = datetime.fromisoformat(ss["eta_utc"])
+        except Exception:
+            eta = None
+    if eta is None:
+        eta = fl["_arr_utc"]
+        return eta, "as scheduled"
+    delta = ss.get("arr_delta_min")
+    if delta is None:
+        note = "on schedule"
+    elif delta <= -10:
+        note = f"~{abs(delta)} min ahead of schedule"
+    elif delta >= 15:
+        note = f"running ~{hhmm(delta)} late"
+    else:
+        note = "on schedule"
+    return eta, note
+
+
+def process_progress(fl, s, st, header, home_tz, now, alt, spd):
+    """While airborne, send occasional en-route + on-approach updates (fires each once)."""
+    try:
+        departed = datetime.fromisoformat(s["departed_utc"]) if s.get("departed_utc") else fl["_dep_utc"]
+    except Exception:
+        departed = fl["_dep_utc"]
+    eta, note = _eta_and_note(fl, st)
+    eta_txt = local_and_home(eta, fl["dest_tz"], home_tz)
+    mins_to_eta = (eta - now).total_seconds() / 60
+
+    # On-approach / descending (once), when close to ETA or clearly descending near the end.
+    if not s.get("approach_sent"):
+        descending = alt and alt < 13000 and mins_to_eta <= 60
+        if mins_to_eta <= APPROACH_BEFORE_ARR_MIN or descending:
+            s["approach_sent"] = True
+            notify(f"{header}\n\n🛬 <b>On approach to {fl['dest_name']}</b>\n"
+                   f"Descending now · landing ~{eta_txt}\nStatus: {note}. Touchdown confirmation to follow.")
+            log(f"   >> APPROACH update sent for {fl['number']}")
+            return
+
+    # En-route milestones (only for longer flights, to avoid noise on short hops).
+    total_min = (eta - departed).total_seconds() / 60
+    if total_min < PROGRESS_MIN_DURATION_MIN:
+        return
+    frac = (now - departed).total_seconds() / 60 / total_min if total_min > 0 else 0
+    done = set(s.get("progress_sent", []))
+    for m in PROGRESS_FRACTIONS:
+        tag = str(int(m * 100))
+        if frac >= m and tag not in done and mins_to_eta > APPROACH_BEFORE_ARR_MIN:
+            done.add(tag)
+            s["progress_sent"] = sorted(done)
+            alt_txt = f"{alt:,} ft · {spd} kt" if alt else "en route"
+            notify(f"{header}\n\n🧭 <b>En route — ~{tag}% there</b>\n"
+                   f"Toward {fl['dest_name']} · {alt_txt}\n"
+                   f"Status: {note} · ETA {eta_txt}")
+            log(f"   >> PROGRESS {tag}% update sent for {fl['number']}")
+            return  # at most one progress message per poll
 
 
 def _fire_landing(fl, s, header, home_tz, now, reason):
