@@ -55,7 +55,8 @@ IDLE_SLEEP_SEC = 300             # sleep when no window is open (local loop)
 WINDOW_BEFORE_DEP_MIN = 45       # start position-watching this long before departure
 WINDOW_AFTER_ARR_HRS = 4         # keep position-watching this long after arrival
 PREDEP_REMINDER_MIN = 30         # "departs soon" reminder this long before departure
-MISSING_POLLS_FOR_LANDING = 2    # consecutive "gone from feed" polls = landed
+MISSING_POLLS_FOR_LANDING = 3    # consecutive "gone from feed" polls before a radar-drop can mean landed
+MIN_ELAPSED_FRAC_FOR_RADAR_LAND = 0.85  # a radar-drop landing also requires >= this much of the flight elapsed
 AIRBORNE_MIN_ALT_FT = 1000       # altitude above which we consider it truly flying
 
 STATUS_BEFORE_DEP_HRS = 10       # start status-watching (delays/gate) this long before dep
@@ -318,7 +319,7 @@ def process_status(fl, st, home_tz, now):
             save_state(st)
 
     # Cancellation
-    if ("cancel" in status_l) and not s["cancel_alerted"]:
+    if ("cancel" in status_l) and not s.get("cancel_alerted"):
         s["cancel_alerted"] = True
         notify(f"{header}\n\n🛑 <b>CANCELLED</b>\n{fl['origin_name']} → {fl['dest_name']}\n"
                f"Airline status: {info['status']}. Check with China Southern for rebooking.")
@@ -326,7 +327,7 @@ def process_status(fl, st, home_tz, now):
 
     # Diversion
     diverted = ("divert" in status_l) or (info["arr_airport"] and info["arr_airport"] != fl["dest_iata"])
-    if diverted and not s["divert_alerted"]:
+    if diverted and not s.get("divert_alerted"):
         s["divert_alerted"] = True
         to = info["arr_airport"] or "another airport"
         notify(f"{header}\n\n🛑 <b>DIVERTED</b>\nNow routing to {to} instead of {fl['dest_iata']}.")
@@ -335,7 +336,7 @@ def process_status(fl, st, home_tz, now):
     # Departure delay (revised vs scheduled)
     if info["dep_revised"] and info["dep_sched"]:
         delay = (info["dep_revised"] - info["dep_sched"]).total_seconds() / 60
-        prev = s["dep_delay_alerted"]
+        prev = s.get("dep_delay_alerted")
         if delay >= DELAY_ALERT_MIN and (prev is None or abs(delay - prev) >= DELAY_REALERT_MIN):
             s["dep_delay_alerted"] = delay
             notify(f"{header}\n\n🕒 <b>DEPARTURE DELAYED</b> +{hhmm(delay)}\n"
@@ -346,7 +347,7 @@ def process_status(fl, st, home_tz, now):
     # Arrival delay (only meaningful, avoids double-noise with dep delay)
     if info["arr_revised"] and info["arr_sched"]:
         adelay = (info["arr_revised"] - info["arr_sched"]).total_seconds() / 60
-        prev = s["arr_delay_alerted"]
+        prev = s.get("arr_delay_alerted")
         if adelay >= ARR_DELAY_ALERT_MIN and (prev is None or abs(adelay - prev) >= DELAY_REALERT_MIN):
             s["arr_delay_alerted"] = adelay
             notify(f"{header}\n\n🕒 <b>ARRIVING LATER</b> +{hhmm(adelay)}\n"
@@ -356,13 +357,13 @@ def process_status(fl, st, home_tz, now):
 
     # Gate / terminal changes (baseline the first time, alert on later changes)
     if info["dep_gate"]:
-        if s["baseline"] and s["gate"] and info["dep_gate"] != s["gate"]:
+        if s.get("baseline") and s.get("gate") and info["dep_gate"] != s["gate"]:
             notify(f"{header}\n\n🚪 <b>GATE CHANGE</b> at {fl['origin_name']}\n"
                    f"{s['gate']} → <b>{info['dep_gate']}</b>")
             log(f"   >> GATE change alert sent for {fl['number']}")
         s["gate"] = info["dep_gate"]
     if info["dep_terminal"]:
-        if s["baseline"] and s["terminal"] and info["dep_terminal"] != s["terminal"]:
+        if s.get("baseline") and s.get("terminal") and info["dep_terminal"] != s["terminal"]:
             notify(f"{header}\n\n🚪 <b>TERMINAL CHANGE</b> at {fl['origin_name']}\n"
                    f"T{s['terminal']} → <b>T{info['dep_terminal']}</b>")
             log(f"   >> TERMINAL change alert sent for {fl['number']}")
@@ -451,16 +452,24 @@ def process_flight(api, fl, st, home_tz, now):
                 log(f"   >> DEPARTURE alert sent for {fl['number']}")
             # Proactive "how's the trip going" updates while en route.
             process_progress(fl, s, st, header, home_tz, now, alt, spd)
-        elif on_ground and s["seen_airborne"] and _near_arrival(fl, st, now):
+        elif (on_ground and s["seen_airborne"] and _near_arrival(fl, st, now)
+              and not _status_says_enroute(fl, st)):
             _fire_landing(fl, s, header, home_tz, now, "on-ground near destination")
     else:
         if s["seen_airborne"] and s["phase"] == "AIRBORNE":
             s["missing_polls"] += 1
+            # A radar dropout is a plausible landing ONLY if ALL hold:
+            #   1) we're within ~45 min of the (live) ETA,
+            #   2) at least 85% of the flight has elapsed, and
+            #   3) AeroDataBox does not still report the flight en route.
+            # Otherwise it's a coverage gap over remote airspace — NOT a landing.
             near = _near_arrival(fl, st, now)
-            log(f"   {fl['number']}: not in feed ({s['missing_polls']}/{MISSING_POLLS_FOR_LANDING}) near_arrival={near}")
-            # A radar dropout is only a landing when we're actually near the ETA.
-            # Mid-flight coverage gaps over remote airspace are NOT landings.
-            if near and s["missing_polls"] >= MISSING_POLLS_FOR_LANDING:
+            frac = _elapsed_frac(fl, s, st, now)
+            enroute = _status_says_enroute(fl, st)
+            allow = (near and frac >= MIN_ELAPSED_FRAC_FOR_RADAR_LAND and not enroute)
+            log(f"   {fl['number']}: not in feed ({s['missing_polls']}/{MISSING_POLLS_FOR_LANDING}) "
+                f"near_arrival={near} elapsed={frac:.0%} enroute={enroute} allow_land={allow}")
+            if allow and s["missing_polls"] >= MISSING_POLLS_FOR_LANDING:
                 _fire_landing(fl, s, header, home_tz, now, "dropped off radar near destination")
         else:
             log(f"   {fl['number']}: not airborne yet / not in feed")
@@ -533,6 +542,32 @@ def _near_arrival(fl, st, now):
     """True once we're within LANDING_NEAR_ETA_MIN of the (best-known) arrival time."""
     eta, _ = _eta_and_note(fl, st)
     return now >= eta - timedelta(minutes=LANDING_NEAR_ETA_MIN)
+
+
+# Airline statuses that mean the flight is definitely NOT on the ground at destination.
+# If AeroDataBox reports any of these, a FlightRadar radar-dropout must NOT be read as a
+# landing — the status feed is the authority; we wait for "Arrived" or a genuine touchdown.
+_ENROUTE_STATUSES = ("expected", "enroute", "en route", "departed", "boarding",
+                     "delayed", "scheduled", "checkin", "check-in", "gate", "active", "airborne")
+
+
+def _status_says_enroute(fl, st):
+    txt = (st.get(fl["id"] + "#status", {}).get("status_text") or "").lower()
+    if not txt:
+        return False  # no status info — fall back to the geometric guards
+    if "arrived" in txt or "landed" in txt:
+        return False
+    return any(k in txt for k in _ENROUTE_STATUSES)
+
+
+def _elapsed_frac(fl, s, st, now):
+    try:
+        departed = datetime.fromisoformat(s["departed_utc"]) if s.get("departed_utc") else fl["_dep_utc"]
+    except Exception:
+        departed = fl["_dep_utc"]
+    eta, _ = _eta_and_note(fl, st)
+    total = (eta - departed).total_seconds()
+    return ((now - departed).total_seconds() / total) if total > 0 else 1.0
 
 
 def _fire_landing(fl, s, header, home_tz, now, reason):
