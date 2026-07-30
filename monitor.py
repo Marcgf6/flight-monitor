@@ -59,7 +59,8 @@ MISSING_POLLS_FOR_LANDING = 2    # consecutive "gone from feed" polls = landed
 AIRBORNE_MIN_ALT_FT = 1000       # altitude above which we consider it truly flying
 
 STATUS_BEFORE_DEP_HRS = 10       # start status-watching (delays/gate) this long before dep
-STATUS_AFTER_ARR_HRS = 1         # keep status-watching this long after arrival
+STATUS_AFTER_ARR_HRS = 2         # keep status-watching this long after arrival
+LANDING_NEAR_ETA_MIN = 45        # a radar dropout only counts as "landed" within this window of ETA
 STATUS_POLL_SEC = 1200           # how often to hit AeroDataBox per flight (20 min → quota-friendly)
 DELAY_ALERT_MIN = 15             # only alert departure delays >= this many minutes
 DELAY_REALERT_MIN = 15           # re-alert when the delay changes by >= this many minutes
@@ -309,6 +310,13 @@ def process_status(fl, st, home_tz, now):
     header = f"✈️ <b>{fl['number']}</b> {fl['leg']}"
     status_l = info["status"].lower()
 
+    # Authoritative landing from the airline status feed (reliable, unlike a radar drop).
+    if "arrived" in status_l:
+        s_pos = st.get(fl["id"])
+        if s_pos and not s_pos.get("landed_alert"):
+            _fire_landing(fl, s_pos, header, home_tz, now, "AeroDataBox: Arrived")
+            save_state(st)
+
     # Cancellation
     if ("cancel" in status_l) and not s["cancel_alerted"]:
         s["cancel_alerted"] = True
@@ -393,7 +401,18 @@ def process_flight(api, fl, st, home_tz, now):
     })
     s.setdefault("predep_alert", False)
     if s["phase"] == "LANDED":
-        return
+        # Self-heal a FALSE landing (e.g. a mid-flight radar-coverage gap wrongly
+        # read as a landing). If it wasn't a confirmed landing and we're still well
+        # before arrival, the flight can't have landed — resume tracking.
+        eta, _ = _eta_and_note(fl, st)
+        if not s.get("landed_confirmed") and now < eta - timedelta(minutes=30):
+            log(f"   {fl['number']}: reverting FALSE landing "
+                f"({int((eta - now).total_seconds()/60)}m before ETA) — resuming tracking")
+            s["phase"] = "AIRBORNE"
+            s["landed_alert"] = False
+            s["missing_polls"] = 0
+        else:
+            return
 
     header = f"✈️ <b>{fl['number']}</b> {fl['leg']}"
 
@@ -432,14 +451,17 @@ def process_flight(api, fl, st, home_tz, now):
                 log(f"   >> DEPARTURE alert sent for {fl['number']}")
             # Proactive "how's the trip going" updates while en route.
             process_progress(fl, s, st, header, home_tz, now, alt, spd)
-        elif on_ground and s["seen_airborne"]:
-            _fire_landing(fl, s, header, home_tz, now, "on-ground at destination")
+        elif on_ground and s["seen_airborne"] and _near_arrival(fl, st, now):
+            _fire_landing(fl, s, header, home_tz, now, "on-ground near destination")
     else:
         if s["seen_airborne"] and s["phase"] == "AIRBORNE":
             s["missing_polls"] += 1
-            log(f"   {fl['number']}: not in feed ({s['missing_polls']}/{MISSING_POLLS_FOR_LANDING})")
-            if s["missing_polls"] >= MISSING_POLLS_FOR_LANDING:
-                _fire_landing(fl, s, header, home_tz, now, "dropped off radar after flight")
+            near = _near_arrival(fl, st, now)
+            log(f"   {fl['number']}: not in feed ({s['missing_polls']}/{MISSING_POLLS_FOR_LANDING}) near_arrival={near}")
+            # A radar dropout is only a landing when we're actually near the ETA.
+            # Mid-flight coverage gaps over remote airspace are NOT landings.
+            if near and s["missing_polls"] >= MISSING_POLLS_FOR_LANDING:
+                _fire_landing(fl, s, header, home_tz, now, "dropped off radar near destination")
         else:
             log(f"   {fl['number']}: not airborne yet / not in feed")
 
@@ -507,11 +529,18 @@ def process_progress(fl, s, st, header, home_tz, now, alt, spd):
             return  # at most one progress message per poll
 
 
+def _near_arrival(fl, st, now):
+    """True once we're within LANDING_NEAR_ETA_MIN of the (best-known) arrival time."""
+    eta, _ = _eta_and_note(fl, st)
+    return now >= eta - timedelta(minutes=LANDING_NEAR_ETA_MIN)
+
+
 def _fire_landing(fl, s, header, home_tz, now, reason):
     if s["landed_alert"]:
         return
     s["phase"] = "LANDED"
     s["landed_alert"] = True
+    s["landed_confirmed"] = True
     delta = round((now - fl["_arr_utc"]).total_seconds() / 60)
     punct = f"{abs(delta)} min early" if delta <= -5 else (f"{delta} min late" if delta >= 15 else "on time")
     notify(f"{header}\n\n🛬 <b>LANDED</b> at {fl['dest_name']}\n"
@@ -524,7 +553,9 @@ def poll_cycle(api, data, st, now):
     home_tz = data["home_tz"]
     any_active = False
     for fl in data["flights"]:
-        if st.get(fl["id"], {}).get("phase") == "LANDED":
+        # Skip only CONFIRMED landings; a bare "LANDED" phase may be a false
+        # radar-dropout landing that process_flight will self-heal.
+        if st.get(fl["id"], {}).get("landed_confirmed"):
             continue
         if status_window_open(fl, now):
             any_active = True
