@@ -1,0 +1,9 @@
+# Never commit secrets, personal data, or local runtime noise.
+.env
+flights.json          # real flight data — lives in the FLIGHTS_JSON secret
+state.json            # runtime state — lives in the Actions cache
+*.log
+launchd.*.log
+state.tmp
+__pycache__/
+*.pyc

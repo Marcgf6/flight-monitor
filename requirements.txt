@@ -1,0 +1,4 @@
+FlightRadarAPI>=1.3.0
+beautifulsoup4
+brotli
+requests

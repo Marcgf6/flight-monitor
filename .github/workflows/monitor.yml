@@ -1,0 +1,70 @@
+name: flight-monitor
+
+# Near-real-time monitoring in GitHub's cloud — no Mac required.
+# Each scheduled run starts a job that polls every ~60s for ~55 minutes, then
+# exits; the next hourly job continues. State is kept in the Actions cache
+# (NOT committed to this public repo), so no personal data is ever exposed.
+# Personal flight data + credentials come from encrypted repo secrets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "serve = ~55-min live loop; once = single cycle; test = send a test alert"
+        default: serve
+        type: choice
+        options: [serve, once, test]
+  schedule:
+    # UTC, hourly, scoped to the travel windows.
+    - cron: "0 18-23 30 7 *"   # Jul 30 evening  — outbound departure day
+    - cron: "0 * 31 7 *"       # Jul 31 all day  — CZ378 arrival + CZ371 Guangzhou→Hanoi
+    - cron: "0 14-23 17 8 *"   # Aug 17 afternoon/evening — CZ626 Bali dep (16:40Z) + status pre-watch
+    - cron: "0 * 18 8 *"       # Aug 18 all day  — CZ626 arrival + CZ377 Guangzhou→Madrid
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flight-monitor
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore monitor state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: flight-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            flight-state-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          NOTIFY_CHANNEL: whatsapp
+          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+          WHATSAPP_APIKEY: ${{ secrets.WHATSAPP_APIKEY }}
+          AERODATABOX_KEY: ${{ secrets.AERODATABOX_KEY }}
+          FLIGHTS_JSON: ${{ secrets.FLIGHTS_JSON }}
+        run: |
+          mode="${{ github.event.inputs.mode }}"
+          mode="${mode:-serve}"
+          python monitor.py --$mode
+
+      - name: Save monitor state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: flight-state-${{ github.run_id }}-${{ github.run_attempt }}

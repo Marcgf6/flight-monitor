@@ -1,0 +1,24 @@
+{
+  "_comment": "SAMPLE ONLY. Real flights are provided at runtime via the FLIGHTS_JSON secret (cloud) or a local flights.json (dev). Copy this to flights.json and edit for local use.",
+  "passenger": "Jane Traveler",
+  "booking": "0000000000000000",
+  "home_tz": "Europe/Madrid",
+  "flights": [
+    {
+      "id": "XX000-20260101",
+      "number": "XX000",
+      "callsign": "XXX000",
+      "airline_icao": "XXX",
+      "trip": "City A → City B",
+      "leg": "1/1  City A → City B",
+      "origin_iata": "AAA",
+      "origin_name": "City A Airport T1",
+      "origin_tz": "Europe/Madrid",
+      "dest_iata": "BBB",
+      "dest_name": "City B Airport T2",
+      "dest_tz": "Asia/Shanghai",
+      "sched_departure_local": "2026-01-01 09:00",
+      "sched_arrival_local": "2026-01-02 06:00"
+    }
+  ]
+}
