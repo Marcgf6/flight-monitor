@@ -835,13 +835,49 @@ def human_duration(mins):
     return hhmm(mins)
 
 
-def build_status_text(api, data, st, now, live=False):
-    """Human-readable state of every flight; `live` also hits FR24 for position."""
+def mentioned_flights(data, text):
+    """Legs the message actually refers to, by flight number or place name."""
+    t = (text or "").lower()
+    hits = []
+    for fl in data["flights"]:
+        num = fl["number"].lower()
+        keys = {num, num.replace(" ", ""), "".join(c for c in num if c.isdigit())}
+        route, _ = _leg_parts(fl)
+        for src in (route, fl.get("origin_name", ""), fl.get("dest_name", "")):
+            for word in re.split(r"[^\w]+", src.lower()):
+                if len(word) > 3:          # skip "t1", "→", airport codes
+                    keys.add(word)
+        if any(k and k in t for k in keys):
+            hits.append(fl)
+    return hits
+
+
+def focus_flights(data, st):
+    """What to show when nothing specific was asked for: whatever is in the air,
+    else the next departure. Printing four legs — three of them weeks out — on
+    every question buries the one answer being looked for."""
+    airborne = [fl for fl in data["flights"]
+                if st.get(fl["id"], {}).get("phase") == "AIRBORNE"]
+    if airborne:
+        return airborne
+    waiting = sorted((fl for fl in data["flights"]
+                      if st.get(fl["id"], {}).get("phase", "WAITING") == "WAITING"),
+                     key=lambda f: f["_dep_utc"])
+    return waiting[:1] or data["flights"]
+
+
+def build_status_text(api, data, st, now, live=False, only=None):
+    """Human-readable flight state; `live` also hits FR24 for position.
+
+    `only` limits the body to a subset; the completed count still reflects the
+    whole trip so the headline never lies about overall progress.
+    """
     home_tz = data["home_tz"]
-    flights = data["flights"]
-    done = sum(1 for fl in flights if st.get(fl["id"], {}).get("phase") == "LANDED")
+    all_flights = data["flights"]
+    flights = all_flights if only is None else only
+    done = sum(1 for fl in all_flights if st.get(fl["id"], {}).get("phase") == "LANDED")
     lines = [f"✈️ <b>Flight status</b>",
-             f"<b>{done} of {len(flights)}</b> legs completed"]
+             f"<b>{done} of {len(all_flights)}</b> legs completed"]
     for fl in flights:
         s = st.get(fl["id"], {})
         phase = s.get("phase", "WAITING")
@@ -873,7 +909,22 @@ def build_status_text(api, data, st, now, live=False):
             togo = (fl["_dep_utc"] - now).total_seconds() / 60
             if togo > 0:
                 lines.append(f"in ~{human_duration(togo)}")
+    hidden = len(all_flights) - len(flights)
+    if hidden > 0:
+        lines.append(f"\n<i>+{hidden} other leg{'s' if hidden > 1 else ''} — "
+                     f"say “all” for the full trip, or name a flight</i>")
     return "\n".join(lines)
+
+
+def select_flights(data, st, text):
+    """Which legs a message wants: the ones it names, everything if it asks for
+    everything, otherwise just what is actually happening."""
+    named = mentioned_flights(data, text)
+    if named:
+        return named
+    if re.search(r"\b(all|everything|full|itinerary|trip|every)\b", (text or "").lower()):
+        return None                     # None == no filtering
+    return focus_flights(data, st)
 
 
 HELP_TEXT = ("🤖 <b>Flight monitor</b>\n\n"
@@ -882,6 +933,9 @@ HELP_TEXT = ("🤖 <b>Flight monitor</b>\n\n"
              "/help — this message\n\n"
              "You can also just ask, e.g. <i>“how long till the next flight?”</i>, "
              "<i>“is it on schedule?”</i>, <i>“when does it land?”</i>, <i>“where is it?”</i>\n\n"
+             "By default I answer about the leg in progress (or the next one). "
+             "Name a flight or city to ask about it — <i>“CZ626”</i>, "
+             "<i>“the Bali flight”</i> — or say <i>“all”</i> for the whole trip.\n\n"
              "I also ping you automatically on departure, landing, "
              "en-route milestones and (when available) delays and gate changes.")
 
@@ -937,10 +991,10 @@ def handle_incoming(api, data, st, now):
             continue
         intent = match_intent(text)
         log(f"   inbound message → intent={intent or 'unrecognised'}")
-        if intent == "status":
-            send_telegram(build_status_text(api, data, st, now))
-        elif intent == "live":
-            send_telegram(build_status_text(api, data, st, now, live=True))
+        if intent in ("status", "live"):
+            only = select_flights(data, st, text)
+            send_telegram(build_status_text(api, data, st, now,
+                                            live=(intent == "live"), only=only))
         elif intent == "help":
             send_telegram(HELP_TEXT)
         else:
