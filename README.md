@@ -27,10 +27,16 @@ its `@username`, so itinerary details never go to a stranger.
 
 `.github/workflows/monitor.yml` runs **continuously**, not in windows. Each job
 executes `python monitor.py --serve`, polling **every ~60 seconds** for ~2h55m.
-A `*/30` cron acts as a handoff/watchdog tick: the `flight-monitor` concurrency
+A `*/10` cron acts as a handoff/watchdog tick: the `flight-monitor` concurrency
 group keeps exactly one job alive, so a new run simply waits and starts the
 instant the previous one exits — no boundary to fall through — and if a job ever
-dies the next tick revives it within ~30 minutes.
+dies the next tick revives it.
+
+The cron is far denser than one handoff every ~3h needs, on purpose: GitHub's
+scheduler is best-effort and **silently drops ticks** under load, so each tick is
+another chance to queue the successor. Ticks that arrive mid-run just queue and
+are superseded by the next one, which is why the Actions tab shows a steady
+stream of **cancelled** runs — that is the mechanism working, not failing.
 
 Runtime state lives in the **Actions cache**, so alerts fire once and nothing
 personal is committed to this public repo.
