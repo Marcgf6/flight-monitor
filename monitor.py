@@ -79,6 +79,11 @@ ARR_DELAY_ALERT_MIN = 20         # only alert arrival delays >= this many minute
 PROGRESS_FRACTIONS = [0.25, 0.50, 0.75]  # send an en-route update at these points of the flight
 PROGRESS_MIN_DURATION_MIN = 180          # only send milestone updates for flights >= 3h
 APPROACH_BEFORE_ARR_MIN = 45             # send an "on approach / descending" update this long before ETA
+
+# Live arrival estimate from FlightRadar24, so the ETA tracks the aircraft
+# instead of being frozen at whatever was known when it took off.
+FR24_ETA_POLL_SEC = 300          # refresh the live ETA this often (an extra request, so not every poll)
+ETA_SHIFT_ALERT_MIN = 15         # tell the user when the arrival time moves by at least this much
 # ---------------------------------------------------------------------------
 
 
@@ -542,6 +547,12 @@ def process_flight(api, fl, st, home_tz, now):
                        f"Scheduled arrival: {local_and_home(fl['_arr_utc'], fl['dest_tz'], home_tz)}")
                 log(f"   >> DEPARTURE alert sent for {fl['number']}")
             # Proactive "how's the trip going" updates while en route.
+            # Refresh the live ETA before the progress update, so any milestone
+            # message quotes the current arrival time rather than a stale one.
+            try:
+                refresh_live_eta(api, fl, st, header, home_tz, now, f)
+            except Exception:
+                log("!! live ETA error:\n" + traceback.format_exc())
             process_progress(fl, s, st, header, home_tz, now, alt, spd)
         elif (on_ground and s["seen_airborne"] and _near_arrival(fl, st, now)
               and not _status_says_enroute(fl, st)):
@@ -566,6 +577,68 @@ def process_flight(api, fl, st, home_tz, now):
             log(f"   {fl['number']}: not airborne yet / not in feed")
 
 
+def fr24_live_eta(api, f):
+    """FlightRadar24's own running arrival estimate (UTC), or None.
+
+    The live feed row carries only position; the details endpoint is what
+    exposes the estimate that actually moves as the aircraft speeds up, slows
+    down or reroutes. Any failure returns None so callers fall back quietly.
+    """
+    try:
+        d = api.get_flight_details(f)
+    except Exception as e:
+        log(f"   FR24 details error: {e}")
+        return None
+    if not isinstance(d, dict):
+        return None
+    times = d.get("time") or {}
+    for group, field in (("estimated", "arrival"), ("other", "eta"), ("real", "arrival")):
+        node = times.get(group)
+        ts = node.get(field) if isinstance(node, dict) else None
+        if ts:
+            try:
+                return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            except Exception:
+                continue
+    return None
+
+
+def refresh_live_eta(api, fl, st, header, home_tz, now, f):
+    """Keep the arrival estimate current mid-flight, and speak up when it moves."""
+    ss = st.setdefault(fl["id"] + "#fr24", {})
+    last = ss.get("polled_utc")
+    if last:
+        try:
+            if (now - datetime.fromisoformat(last)).total_seconds() < FR24_ETA_POLL_SEC:
+                return
+        except Exception:
+            pass
+    ss["polled_utc"] = now.isoformat()
+    eta = fr24_live_eta(api, f)
+    if eta is None:
+        return
+    ss["eta_utc"] = eta.isoformat()
+
+    # Compare against what the user was last told to expect — the previous
+    # announced ETA, or the printed schedule if nothing has been announced yet.
+    told = ss.get("told_eta_utc")
+    try:
+        baseline = datetime.fromisoformat(told) if told else fl["_arr_utc"]
+    except Exception:
+        baseline = fl["_arr_utc"]
+    shift = (eta - baseline).total_seconds() / 60
+    # A couple of minutes of jitter on every refresh is noise, not news.
+    if abs(shift) < ETA_SHIFT_ALERT_MIN:
+        ss.setdefault("told_eta_utc", eta.isoformat())
+        return
+    ss["told_eta_utc"] = eta.isoformat()
+    notify(f"{header}\n\n🕒 <b>Arrival time updated</b>\n"
+           f"Now landing {local_and_home(eta, fl['dest_tz'], home_tz)}\n"
+           f"~{hhmm(abs(shift))} {'later' if shift > 0 else 'earlier'} than the last estimate\n"
+           f"<i>live FlightRadar24 estimate</i>")
+    log(f"   >> ETA shift alert for {fl['number']} ({shift:+.0f} min)")
+
+
 def _eta_and_note(fl, st):
     """Best-known arrival ETA (UTC) and an on-schedule note, using AeroDataBox if present."""
     ss = st.get(fl["id"] + "#status", {})
@@ -586,6 +659,24 @@ def _eta_and_note(fl, st):
         else:
             note = "on schedule"
         return eta, note
+
+    # FlightRadar24's live estimate — the one that keeps moving during the
+    # flight, so a plane that makes up or loses time does not arrive as a
+    # surprise. Preferred over anything derived from the printed schedule.
+    fs = st.get(fl["id"] + "#fr24", {})
+    if fs.get("eta_utc"):
+        try:
+            eta = datetime.fromisoformat(fs["eta_utc"])
+            delta = round((eta - fl["_arr_utc"]).total_seconds() / 60)
+            if delta >= 15:
+                note = f"live estimate · ~{hhmm(delta)} later than scheduled"
+            elif delta <= -10:
+                note = f"live estimate · ~{hhmm(abs(delta))} earlier than scheduled"
+            else:
+                note = "live estimate · on schedule"
+            return eta, note
+        except Exception:
+            pass
 
     # No live status feed (no AeroDataBox key, or it is failing). Returning the
     # printed schedule labelled "as scheduled" asserts on-time with no evidence
