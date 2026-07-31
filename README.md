@@ -26,17 +26,36 @@ its `@username`, so itinerary details never go to a stranger.
 ## How it runs
 
 `.github/workflows/monitor.yml` runs **continuously**, not in windows. Each job
-executes `python monitor.py --serve`, polling **every ~60 seconds** for ~2h55m.
-A `*/10` cron acts as a handoff/watchdog tick: the `flight-monitor` concurrency
-group keeps exactly one job alive, so a new run simply waits and starts the
-instant the previous one exits — no boundary to fall through — and if a job ever
-dies the next tick revives it.
+executes `python monitor.py --serve`, polling **every ~60 seconds** for ~5h45m —
+just under GitHub's 6h job cap, because every handoff between jobs is a chance to
+fall in a hole, so fewer per day is better (4, not 8).
 
-The cron is far denser than one handoff every ~3h needs, on purpose: GitHub's
-scheduler is best-effort and **silently drops ticks** under load, so each tick is
-another chance to queue the successor. Ticks that arrive mid-run just queue and
-are superseded by the next one, which is why the Actions tab shows a steady
-stream of **cancelled** runs — that is the mechanism working, not failing.
+Coverage is continuous only if a successor starts when a job ends. Two
+independent mechanisms drive that:
+
+1. **Self-handoff (deterministic).** A run that served its full window starts its
+   own successor before exiting. This is the reliable path, and it is **optional**
+   — see below.
+2. **`*/10` cron (backstop).** The `flight-monitor` concurrency group keeps
+   exactly one job alive, so a tick landing mid-run just queues and takes over the
+   instant the running job exits. Ticks are superseded by later ones, which is why
+   the Actions tab shows a steady stream of **cancelled** runs — that is the
+   mechanism working, not failing.
+
+The cron alone is not enough: GitHub's scheduler is best-effort and was observed
+**dropping ~90% of ticks** on this repo, once leaving a 43-minute hole between
+jobs. When a tick *is* queued the takeover is instant (measured: 4 seconds).
+
+### Enabling guaranteed handoff (optional)
+
+Add a `HANDOFF_PAT` secret — a fine-grained PAT for this repo with
+**Actions: read and write**. The built-in `GITHUB_TOKEN` cannot be used: GitHub
+deliberately bars it from triggering workflows.
+
+Without the secret the handoff step is a no-op and the cron backstop applies.
+A run only hands off if it wrote `.served-full-term`, so a run that crashed on
+startup — or exited because every flight has landed — ends the chain instead of
+spinning a hot loop.
 
 Runtime state lives in the **Actions cache**, so alerts fire once and nothing
 personal is committed to this public repo.

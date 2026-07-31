@@ -7,3 +7,4 @@ launchd.*.log
 state.tmp
 __pycache__/
 *.pyc
+.served-full-term      # runtime handoff sentinel — see monitor.yml
