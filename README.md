@@ -12,12 +12,32 @@ Near-real-time flight alerts over WhatsApp, running entirely in GitHub Actions
 | 🛫 departed (airborne) | FlightRadar24 live feed |
 | 🛬 landed | FlightRadar24 live feed |
 
+You can also **ask** the bot at any time (Telegram):
+
+| Command | Reply |
+|---------|-------|
+| `/status` | phase, scheduled/ETA times and time remaining for every leg |
+| `/where` | same, plus a live altitude / speed fix |
+| `/help` | command list |
+
+Only the configured `TELEGRAM_CHAT_ID` gets answers — a bot is discoverable by
+its `@username`, so itinerary details never go to a stranger.
+
 ## How it runs
 
-`.github/workflows/monitor.yml` triggers hourly during the travel windows. Each
-run executes `python monitor.py --serve`, which polls **every ~60 seconds** for
-~55 minutes; the next hourly job continues. Runtime state lives in the **Actions
-cache**, so alerts fire once and nothing personal is committed to this public repo.
+`.github/workflows/monitor.yml` runs **continuously**, not in windows. Each job
+executes `python monitor.py --serve`, polling **every ~60 seconds** for ~2h55m.
+A `*/30` cron acts as a handoff/watchdog tick: the `flight-monitor` concurrency
+group keeps exactly one job alive, so a new run simply waits and starts the
+instant the previous one exits — no boundary to fall through — and if a job ever
+dies the next tick revives it within ~30 minutes.
+
+Runtime state lives in the **Actions cache**, so alerts fire once and nothing
+personal is committed to this public repo.
+
+FlightRadar24 is only queried while a flight is inside its watch window; outside
+that the loop just checks for inbound commands, so running 24/7 costs no extra
+flight-data requests. Actions minutes are unlimited on public repos.
 
 This repo is **public** only so Actions minutes are unlimited (enabling the ~1-min
 cadence for free). All personal data and credentials are **encrypted repo secrets**:
@@ -31,7 +51,11 @@ cadence for free). All personal data and credentials are **encrypted repo secret
 ## Changing flights or timing
 
 - **Flights:** edit the `FLIGHTS_JSON` secret (Settings → Secrets → Actions). Shape in `flights.example.json`.
-- **When it runs:** edit the `schedule:` crons in `monitor.yml` (UTC).
+- **When it runs:** edit the `schedule:` cron in `monitor.yml` (UTC). To go back to
+  windowed runs, narrow the cron and shorten `SERVE_MAX_SEC` in the workflow.
+- **Channel:** set the `NOTIFY_CHANNEL` repo **variable** to `whatsapp` or `telegram`.
+  Whichever is not primary is used as an automatic fallback if configured, so a
+  throttled or failing channel can't silently swallow an alert.
 - **Tuning:** thresholds and cadences are constants at the top of `monitor.py`.
 
 ## Run it manually
@@ -53,8 +77,10 @@ python3 monitor.py --status            # show state
 ## Honest limits
 
 - Flight data providers update every minute or two — "live to the second" isn't
-  possible from any source. In-loop cadence is ~60s; there's a ~5-min gap at each
-  hourly job boundary. GitHub's scheduler can also occasionally lag a few minutes.
+  possible from any source. In-loop cadence is ~60s. Job handoffs are seamless,
+  but GitHub's scheduler can still lag a few minutes when reviving a dead job.
+- The loop exits early once every flight has landed, so after the last leg the
+  bot stops answering commands until the next trip is configured.
 - FlightRadar24's free feed only shows airborne aircraft, so departure/landing are
   position-based; landing is confirmed when the flight leaves the live feed (~6–10
   min after touchdown). Delay/gate/cancellation come from AeroDataBox instead.

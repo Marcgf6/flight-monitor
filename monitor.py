@@ -50,7 +50,10 @@ LOG_FILE = BASE / "monitor.log"
 # --- tunables ---------------------------------------------------------------
 POLL_INTERVAL_SEC = 180          # cadence for the plain continuous loop (local)
 SERVE_POLL_SEC = 60              # cadence in --serve mode (cloud, ~1 minute)
-SERVE_MAX_SEC = 3300             # --serve runs ~55 min, then exits (next cron job continues)
+# How long one --serve job stays alive. Overridable so the cloud job can run
+# for hours (a long job + a frequent cron = seamless handoff, no coverage gap)
+# while local runs keep the short default.
+SERVE_MAX_SEC = int(os.environ.get("SERVE_MAX_SEC") or 3300)
 IDLE_SLEEP_SEC = 300             # sleep when no window is open (local loop)
 
 WINDOW_BEFORE_DEP_MIN = 45       # start position-watching this long before departure
