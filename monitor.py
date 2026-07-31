@@ -722,8 +722,41 @@ HELP_TEXT = ("🤖 <b>Flight monitor</b>\n\n"
              "/status — where every flight stands\n"
              "/where — same, plus live altitude &amp; speed\n"
              "/help — this message\n\n"
+             "You can also just ask, e.g. <i>“how long till the next flight?”</i>, "
+             "<i>“is it on schedule?”</i>, <i>“when does it land?”</i>, <i>“where is it?”</i>\n\n"
              "I also ping you automatically on departure, landing, "
              "en-route milestones and (when available) delays and gate changes.")
+
+# Plain-language routing. Every question people actually ask ("how long?",
+# "on time?", "when does it land?") is already answered by the status reply —
+# it carries time-to-departure, ETA and the on-schedule note — so the only gap
+# is recognising the question. Keyword matching does that deterministically,
+# with no model API to add latency, cost, or a mid-trip failure mode.
+_LIVE_WORDS = ("where", "position", "altitude", "how high", "speed", "how fast",
+               "live", "map", "over ", "flying")
+_STATUS_WORDS = ("how long", "when", "next", "schedule", "on time", "ontime",
+                 "delay", "late", "eta", "arriv", "land", "status", "flight",
+                 "left", "remaining", "time", "long till", "long until")
+
+
+def match_intent(text):
+    """Map a slash command or a plain-language question to an intent."""
+    t = text.lower().strip()
+    words = t.lstrip("/").split()
+    first = words[0].split("@")[0] if words else ""
+    if first in ("help", "start", "commands"):
+        return "help"
+    if first in ("where", "live", "position"):
+        return "live"
+    if first in ("status", "flights", "eta"):
+        return "status"
+    # Longest-standing phrasings first: a position question mentioning "land"
+    # should still be answered as a position question.
+    if any(k in t for k in _LIVE_WORDS):
+        return "live"
+    if any(k in t for k in _STATUS_WORDS):
+        return "status"
+    return None
 
 
 def handle_incoming(api, data, st, now):
@@ -744,14 +777,17 @@ def handle_incoming(api, data, st, now):
         if str((msg.get("chat") or {}).get("id", "")) != chat_id:
             log("   ignoring inbound message from a non-owner chat")
             continue
-        cmd = text.split()[0].lstrip("/").split("@")[0].lower()
-        log(f"   inbound command: /{cmd}")
-        if cmd in ("status", "flights", "eta"):
+        intent = match_intent(text)
+        log(f"   inbound message → intent={intent or 'unrecognised'}")
+        if intent == "status":
             send_telegram(build_status_text(api, data, st, now))
-        elif cmd in ("where", "live", "position"):
+        elif intent == "live":
             send_telegram(build_status_text(api, data, st, now, live=True))
-        else:
+        elif intent == "help":
             send_telegram(HELP_TEXT)
+        else:
+            # Say what wasn't understood rather than silently dumping help.
+            send_telegram("🤔 I didn't catch that.\n\n" + HELP_TEXT)
 
 
 def poll_cycle(api, data, st, now):
