@@ -41,8 +41,10 @@ jobs:
   poll:
     runs-on: ubuntu-latest
     # Must exceed SERVE_MAX_SEC below so the loop exits on its own terms and
-    # the state-saving step still runs. Hosted runners cap a job at 6h.
-    timeout-minutes: 180
+    # the state-saving step still runs. Hosted runners cap a job at 6h, and we
+    # sit just under it: every handoff is a chance to fall in a hole, so the
+    # fewer of them per day the better.
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -67,10 +69,11 @@ jobs:
           # to switch. Whichever is not primary is used as an automatic fallback
           # if it is configured, so a throttled channel can't swallow an alert.
           NOTIFY_CHANNEL: ${{ vars.NOTIFY_CHANNEL || 'whatsapp' }}
-          # ~2h55m, comfortably inside the job timeout above. State is cached
-          # when the job ends, so this also bounds how much state a hard runner
-          # failure could cost.
-          SERVE_MAX_SEC: "10500"
+          # ~5h45m, just inside the job timeout above: 4 handoffs a day instead
+          # of 8, halving the exposure to a dropped scheduler tick. State is
+          # cached when the job ends, so this also bounds how much state a hard
+          # runner failure could cost.
+          SERVE_MAX_SEC: "20700"
           WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
           WHATSAPP_APIKEY: ${{ secrets.WHATSAPP_APIKEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -88,3 +91,36 @@ jobs:
         with:
           path: state.json
           key: flight-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Deterministic handoff. GitHub's scheduler is best-effort and has been
+      # observed dropping ~90% of ticks on this repo, which once left a 43-min
+      # hole between jobs. Starting our own successor removes the scheduler
+      # from the critical path; the cron above stays as a backstop.
+      #
+      # Entirely optional: with no HANDOFF_PAT secret this is a no-op and
+      # nothing changes. It needs a PAT because the built-in GITHUB_TOKEN is
+      # deliberately barred from triggering workflows.
+      - name: Hand off to the next run
+        if: always()
+        env:
+          HANDOFF_PAT: ${{ secrets.HANDOFF_PAT }}
+        run: |
+          if [ -z "$HANDOFF_PAT" ]; then
+            echo "No HANDOFF_PAT secret — relying on the cron backstop."; exit 0
+          fi
+          # Only a run that served its whole window hands off. A crash on
+          # startup, or an exit because every flight has landed, leaves no flag
+          # and so ends the chain instead of spinning a hot loop.
+          if [ ! -f .served-full-term ]; then
+            echo "Did not serve a full term — not handing off."; exit 0
+          fi
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $HANDOFF_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/monitor.yml/dispatches" \
+            -d '{"ref":"main","inputs":{"mode":"serve"}}')
+          if [ "$code" = "204" ]; then
+            echo "Successor dispatched."
+          else
+            echo "Handoff dispatch failed (HTTP $code) — cron backstop will recover."
+          fi

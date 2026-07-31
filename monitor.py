@@ -44,6 +44,10 @@ import urllib.error
 BASE = Path(__file__).resolve().parent
 FLIGHTS_FILE = BASE / "flights.json"
 STATE_FILE = BASE / "state.json"
+# Written only when a --serve run completes its full window. The workflow hands
+# off to a successor only if it exists, so a run that crashed on startup or
+# exited immediately (all flights landed) can never start a hot chain.
+FULL_TERM_FLAG = BASE / ".served-full-term"
 ENV_FILE = BASE / ".env"
 LOG_FILE = BASE / "monitor.log"
 
@@ -108,6 +112,13 @@ def load_flights():
         fl["_dep_utc"] = dep.replace(tzinfo=ZoneInfo(fl["origin_tz"])).astimezone(timezone.utc)
         fl["_arr_utc"] = arr.replace(tzinfo=ZoneInfo(fl["dest_tz"])).astimezone(timezone.utc)
     return data
+
+
+def _mark_served_full_term():
+    try:
+        FULL_TERM_FLAG.write_text("ok\n")
+    except Exception:
+        pass
 
 
 def load_state():
@@ -918,7 +929,8 @@ def main():
             except Exception:
                 log("!! serve error:\n" + traceback.format_exc())
             time.sleep(SERVE_POLL_SEC)
-        log("serve window elapsed; exiting (next scheduled job continues).")
+        log("serve window elapsed; exiting (next job continues).")
+        _mark_served_full_term()
         return
 
     # Plain continuous loop (local dev) — sends a one-time startup ping.
