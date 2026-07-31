@@ -388,7 +388,7 @@ def process_status(fl, st, home_tz, now):
         save_state(st)
         return
 
-    header = f"✈️ <b>{fl['number']}</b> {fl['leg']}"
+    header = _flight_header(fl)
     status_l = info["status"].lower()
 
     # Authoritative landing from the airline status feed (reliable, unlike a radar drop).
@@ -495,7 +495,7 @@ def process_flight(api, fl, st, home_tz, now):
         else:
             return
 
-    header = f"✈️ <b>{fl['number']}</b> {fl['leg']}"
+    header = _flight_header(fl)
 
     mins_to_dep = (fl["_dep_utc"] - now).total_seconds() / 60
     if (not s["predep_alert"] and not s["departed_alert"]
@@ -684,24 +684,63 @@ def telegram_get_updates(offset=None):
         return []
 
 
+_LEG_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s+(.*)$")
+
+
+def _leg_parts(fl):
+    """Split a "N/M  Origin → Dest" label into (route, spelled-out leg marker).
+
+    Printed bare beside the flight number, "2/2" reads as a completion counter
+    ("2 of 2 done") rather than "leg 2 of 2" — so spell it out and move it off
+    the headline.
+    """
+    m = _LEG_RE.match(fl.get("leg") or "")
+    if not m:
+        return ((fl.get("leg") or fl.get("trip") or "").strip(), "")
+    return m.group(3).strip(), f"leg {m.group(1)} of {m.group(2)}"
+
+
+def _flight_header(fl):
+    """Alert headline. Same spelled-out leg treatment as the status reply, so a
+    departure alert can't be misread as "2 of 2 flights done" either."""
+    route, leg = _leg_parts(fl)
+    return f"✈️ <b>{fl['number']}</b> {route}" + (f"\n<i>{leg}</i>" if leg else "")
+
+
+def human_duration(mins):
+    """Like hhmm() but rolls into days — "17d 5h" beats "413h 51m"."""
+    mins = int(round(abs(mins)))
+    days, rem = divmod(mins, 1440)
+    hrs = rem // 60
+    if days:
+        return f"{days}d {hrs}h" if hrs else f"{days}d"
+    return hhmm(mins)
+
+
 def build_status_text(api, data, st, now, live=False):
     """Human-readable state of every flight; `live` also hits FR24 for position."""
     home_tz = data["home_tz"]
-    lines = ["✈️ <b>Flight status</b>"]
-    for fl in data["flights"]:
+    flights = data["flights"]
+    done = sum(1 for fl in flights if st.get(fl["id"], {}).get("phase") == "LANDED")
+    lines = [f"✈️ <b>Flight status</b>",
+             f"<b>{done} of {len(flights)}</b> legs completed"]
+    for fl in flights:
         s = st.get(fl["id"], {})
         phase = s.get("phase", "WAITING")
+        route, leg = _leg_parts(fl)
         icon = {"WAITING": "🕐", "AIRBORNE": "🛫", "LANDED": "🛬"}.get(phase, "•")
-        lines.append(f"\n{icon} <b>{fl['number']}</b> {fl['leg']}")
+        lines.append(f"\n{icon} <b>{fl['number']}</b> {route}")
+        if leg:
+            lines.append(f"<i>{leg}</i>")
         if phase == "LANDED":
-            lines.append("Landed ✅")
+            lines.append("✅ Landed")
             continue
         eta, note = _eta_and_note(fl, st)
         if phase == "AIRBORNE":
-            lines.append(f"In the air — ETA {local_and_home(eta, fl['dest_tz'], home_tz)}")
+            lines.append(f"🛫 In the air — ETA {local_and_home(eta, fl['dest_tz'], home_tz)}")
             left = (eta - now).total_seconds() / 60
             if left > 0:
-                lines.append(f"~{hhmm(left)} remaining · {note}")
+                lines.append(f"~{human_duration(left)} remaining · {note}")
             if live:
                 f = find_live_flight(api, fl)
                 if f is not None:
@@ -711,10 +750,11 @@ def build_status_text(api, data, st, now, live=False):
                 else:
                     lines.append("📍 not in the live radar feed right now")
         else:
-            lines.append(f"Departs {local_and_home(fl['_dep_utc'], fl['origin_tz'], home_tz)}")
+            lines.append(f"⏳ Not departed yet — departs "
+                         f"{local_and_home(fl['_dep_utc'], fl['origin_tz'], home_tz)}")
             togo = (fl["_dep_utc"] - now).total_seconds() / 60
             if togo > 0:
-                lines.append(f"in ~{hhmm(togo)}")
+                lines.append(f"in ~{human_duration(togo)}")
     return "\n".join(lines)
 
 
