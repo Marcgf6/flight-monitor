@@ -52,9 +52,14 @@ jobs:
 
       - name: Run monitor
         env:
-          NOTIFY_CHANNEL: whatsapp
+          # Primary channel; set the NOTIFY_CHANNEL repo variable to "telegram"
+          # to switch. Whichever is not primary is used as an automatic fallback
+          # if it is configured, so a throttled channel can't swallow an alert.
+          NOTIFY_CHANNEL: ${{ vars.NOTIFY_CHANNEL || 'whatsapp' }}
           WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
           WHATSAPP_APIKEY: ${{ secrets.WHATSAPP_APIKEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           AERODATABOX_KEY: ${{ secrets.AERODATABOX_KEY }}
           FLIGHTS_JSON: ${{ secrets.FLIGHTS_JSON }}
         run: |

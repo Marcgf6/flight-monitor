@@ -128,25 +128,36 @@ def _to_whatsapp(text):
 
 
 def notify(text, verbose=False):
+    """Send an alert, falling back to the secondary channel if the primary fails.
+
+    A travel alert is worthless if it silently vanishes, so any configured
+    second channel is tried before giving up (CallMeBot's free WhatsApp tier
+    throttles aggressively and then accepts-but-drops messages).
+    """
     channel = os.environ.get("NOTIFY_CHANNEL", "").strip().lower()
     have_wa = bool(os.environ.get("WHATSAPP_APIKEY") and os.environ.get("WHATSAPP_PHONE"))
     have_tg = bool(os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"))
     if not channel:
         channel = "whatsapp" if have_wa else ("telegram" if have_tg else "")
-    if channel == "whatsapp":
-        ok = send_whatsapp(text, verbose=verbose)
-    elif channel == "telegram":
-        ok = send_telegram(text)
-    else:
+    available = {"whatsapp": have_wa, "telegram": have_tg}
+    if not any(available.values()):
         log("!! No notification channel configured. Message would have been:\n" + text)
         return False
-    # Authoritative delivery record — independent of the caller's optimistic
-    # ">> alert sent" line — so the logs always show whether an alert truly landed.
-    if ok:
-        log(f"   ✓ delivered via {channel}")
-    else:
-        log(f"   ✗ DELIVERY FAILED via {channel} — alert was NOT received (see error above)")
-    return ok
+
+    # Primary first, then whatever else is configured.
+    for ch in [channel] + [c for c in ("telegram", "whatsapp") if c != channel]:
+        if not available.get(ch):
+            continue
+        ok = send_whatsapp(text, verbose=verbose) if ch == "whatsapp" else send_telegram(text)
+        # Authoritative delivery record — independent of the caller's optimistic
+        # ">> alert sent" line — so the logs always show whether an alert landed.
+        if ok:
+            log(f"   ✓ delivered via {ch}")
+            return True
+        log(f"   ✗ delivery failed via {ch}"
+            + ("; trying fallback channel" if ch == channel else ""))
+    log("   ✗ DELIVERY FAILED on all channels — alert was NOT received")
+    return False
 
 
 def send_whatsapp(text, attempts=3, verbose=False):
@@ -178,6 +189,12 @@ def send_whatsapp(text, attempts=3, verbose=False):
             # ("You need to activate the API..."). Surface the FULL body so the real
             # cause is visible instead of a silently-swallowed "unclear" response.
             last = body.strip().replace("\n", " ")
+            # Retrying a throttled API only digs the hole deeper, so bail out
+            # immediately and let notify() fall back to the other channel.
+            if any(x in body.lower() for x in ("too many requests", "called to the api to often",
+                                               "called to the api too often", "rate limit")):
+                log("!! WhatsApp RATE-LIMITED by CallMeBot — not retrying. Response: " + last[:300])
+                return False
             log(f"!! WhatsApp/CallMeBot did NOT confirm delivery (attempt {i}/{attempts}). "
                 f"Full response: {last[:400]}")
         except Exception as e:
