@@ -134,30 +134,51 @@ def notify(text):
     if not channel:
         channel = "whatsapp" if have_wa else ("telegram" if have_tg else "")
     if channel == "whatsapp":
-        return send_whatsapp(text)
-    if channel == "telegram":
-        return send_telegram(text)
-    log("!! No notification channel configured. Message would have been:\n" + text)
-    return False
+        ok = send_whatsapp(text)
+    elif channel == "telegram":
+        ok = send_telegram(text)
+    else:
+        log("!! No notification channel configured. Message would have been:\n" + text)
+        return False
+    # Authoritative delivery record — independent of the caller's optimistic
+    # ">> alert sent" line — so the logs always show whether an alert truly landed.
+    if ok:
+        log(f"   ✓ delivered via {channel}")
+    else:
+        log(f"   ✗ DELIVERY FAILED via {channel} — alert was NOT received (see error above)")
+    return ok
 
 
-def send_whatsapp(text):
+def send_whatsapp(text, attempts=3):
     phone = os.environ.get("WHATSAPP_PHONE", "").replace("+", "").replace(" ", "")
     apikey = os.environ.get("WHATSAPP_APIKEY", "").strip()
     if not phone or not apikey:
-        log("!! WhatsApp not configured. Message would have been:\n" + text)
+        log("!! WhatsApp not configured (WHATSAPP_PHONE / WHATSAPP_APIKEY missing). "
+            "Message would have been:\n" + text)
         return False
     q = urllib.parse.urlencode({"phone": phone, "text": _to_whatsapp(text), "apikey": apikey})
-    try:
-        with urllib.request.urlopen("https://api.callmebot.com/whatsapp.php?" + q, timeout=25) as r:
-            body = r.read().decode(errors="replace")
-        if any(x in body.lower() for x in ("message queued", "message sent", "successfully")):
-            return True
-        log("!! WhatsApp/CallMeBot response unclear (may still arrive): " + body[:160].replace("\n", " "))
-        return True
-    except Exception as e:
-        log(f"!! WhatsApp send failed: {e}")
-        return False
+    url = "https://api.callmebot.com/whatsapp.php?" + q
+    last = ""
+    for i in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=25) as r:
+                body = r.read().decode(errors="replace")
+            if any(x in body.lower() for x in ("message queued", "message sent", "successfully")):
+                return True
+            # CallMeBot returns HTTP 200 with a human-readable error IN THE BODY when
+            # the apikey is wrong/expired or the number hasn't authorised the bot
+            # ("You need to activate the API..."). Surface the FULL body so the real
+            # cause is visible instead of a silently-swallowed "unclear" response.
+            last = body.strip().replace("\n", " ")
+            log(f"!! WhatsApp/CallMeBot did NOT confirm delivery (attempt {i}/{attempts}). "
+                f"Full response: {last[:400]}")
+        except Exception as e:
+            last = str(e)
+            log(f"!! WhatsApp send error (attempt {i}/{attempts}): {e}")
+        if i < attempts:
+            time.sleep(2 * i)
+    log("!! WhatsApp NOT delivered after retries — last response: " + (last[:400] or "(empty)"))
+    return False
 
 
 def send_telegram(text):
