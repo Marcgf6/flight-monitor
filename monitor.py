@@ -661,9 +661,103 @@ def _fire_landing(fl, s, header, home_tz, now, reason):
     log(f"   >> LANDING alert sent for {fl['number']} ({reason})")
 
 
+# --- inbound Telegram commands (ask the bot for a live update) --------------
+def telegram_get_updates(offset=None):
+    """Fetch new messages sent TO the bot. Returns [] on any problem."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return []
+    q = {"timeout": 0}
+    if offset is not None:
+        q["offset"] = offset
+    try:
+        with urllib.request.urlopen(
+                f"https://api.telegram.org/bot{token}/getUpdates?" + urllib.parse.urlencode(q),
+                timeout=20) as r:
+            d = json.loads(r.read().decode())
+        return d.get("result", []) if d.get("ok") else []
+    except Exception as e:
+        log(f"   telegram getUpdates error: {e}")
+        return []
+
+
+def build_status_text(api, data, st, now, live=False):
+    """Human-readable state of every flight; `live` also hits FR24 for position."""
+    home_tz = data["home_tz"]
+    lines = ["✈️ <b>Flight status</b>"]
+    for fl in data["flights"]:
+        s = st.get(fl["id"], {})
+        phase = s.get("phase", "WAITING")
+        icon = {"WAITING": "🕐", "AIRBORNE": "🛫", "LANDED": "🛬"}.get(phase, "•")
+        lines.append(f"\n{icon} <b>{fl['number']}</b> {fl['leg']}")
+        if phase == "LANDED":
+            lines.append("Landed ✅")
+            continue
+        eta, note = _eta_and_note(fl, st)
+        if phase == "AIRBORNE":
+            lines.append(f"In the air — ETA {local_and_home(eta, fl['dest_tz'], home_tz)}")
+            left = (eta - now).total_seconds() / 60
+            if left > 0:
+                lines.append(f"~{hhmm(left)} remaining · {note}")
+            if live:
+                f = find_live_flight(api, fl)
+                if f is not None:
+                    alt = getattr(f, "altitude", 0) or 0
+                    spd = getattr(f, "ground_speed", 0) or 0
+                    lines.append(f"📍 {alt:,} ft · {spd} kt")
+                else:
+                    lines.append("📍 not in the live radar feed right now")
+        else:
+            lines.append(f"Departs {local_and_home(fl['_dep_utc'], fl['origin_tz'], home_tz)}")
+            togo = (fl["_dep_utc"] - now).total_seconds() / 60
+            if togo > 0:
+                lines.append(f"in ~{hhmm(togo)}")
+    return "\n".join(lines)
+
+
+HELP_TEXT = ("🤖 <b>Flight monitor</b>\n\n"
+             "/status — where every flight stands\n"
+             "/where — same, plus live altitude &amp; speed\n"
+             "/help — this message\n\n"
+             "I also ping you automatically on departure, landing, "
+             "en-route milestones and (when available) delays and gate changes.")
+
+
+def handle_incoming(api, data, st, now):
+    """Answer commands texted to the bot. Telegram only; owner's chat only."""
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not (os.environ.get("TELEGRAM_BOT_TOKEN") and chat_id):
+        return
+    for u in telegram_get_updates(st.get("_tg_offset")):
+        # Advance the offset even for messages we ignore, so one unparseable
+        # or foreign message can't wedge the queue forever.
+        st["_tg_offset"] = u["update_id"] + 1
+        msg = u.get("message") or u.get("edited_message") or {}
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+        # Anyone can find a bot by its @username, so only the configured chat
+        # gets answers — never leak itinerary details to a stranger.
+        if str((msg.get("chat") or {}).get("id", "")) != chat_id:
+            log("   ignoring inbound message from a non-owner chat")
+            continue
+        cmd = text.split()[0].lstrip("/").split("@")[0].lower()
+        log(f"   inbound command: /{cmd}")
+        if cmd in ("status", "flights", "eta"):
+            send_telegram(build_status_text(api, data, st, now))
+        elif cmd in ("where", "live", "position"):
+            send_telegram(build_status_text(api, data, st, now, live=True))
+        else:
+            send_telegram(HELP_TEXT)
+
+
 def poll_cycle(api, data, st, now):
     home_tz = data["home_tz"]
     any_active = False
+    try:
+        handle_incoming(api, data, st, now)
+    except Exception:
+        log("!! inbound command error:\n" + traceback.format_exc())
     for fl in data["flights"]:
         # Skip only CONFIRMED landings; a bare "LANDED" phase may be a false
         # radar-dropout landing that process_flight will self-heal.
