@@ -127,14 +127,14 @@ def _to_whatsapp(text):
     return re.sub(r"<[^>]+>", "", text)
 
 
-def notify(text):
+def notify(text, verbose=False):
     channel = os.environ.get("NOTIFY_CHANNEL", "").strip().lower()
     have_wa = bool(os.environ.get("WHATSAPP_APIKEY") and os.environ.get("WHATSAPP_PHONE"))
     have_tg = bool(os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"))
     if not channel:
         channel = "whatsapp" if have_wa else ("telegram" if have_tg else "")
     if channel == "whatsapp":
-        ok = send_whatsapp(text)
+        ok = send_whatsapp(text, verbose=verbose)
     elif channel == "telegram":
         ok = send_telegram(text)
     else:
@@ -149,13 +149,19 @@ def notify(text):
     return ok
 
 
-def send_whatsapp(text, attempts=3):
+def send_whatsapp(text, attempts=3, verbose=False):
     phone = os.environ.get("WHATSAPP_PHONE", "").replace("+", "").replace(" ", "")
     apikey = os.environ.get("WHATSAPP_APIKEY", "").strip()
     if not phone or not apikey:
         log("!! WhatsApp not configured (WHATSAPP_PHONE / WHATSAPP_APIKEY missing). "
             "Message would have been:\n" + text)
         return False
+    if verbose:
+        # Masked config summary — never the full secret — to sanity-check the
+        # phone/apikey pairing (CallMeBot can accept a request yet never deliver
+        # if the number or key is wrong).
+        log(f"   config: WHATSAPP_PHONE {len(phone)} digits ending ..{phone[-2:]} · "
+            f"WHATSAPP_APIKEY {len(apikey)} chars")
     q = urllib.parse.urlencode({"phone": phone, "text": _to_whatsapp(text), "apikey": apikey})
     url = "https://api.callmebot.com/whatsapp.php?" + q
     last = ""
@@ -163,6 +169,8 @@ def send_whatsapp(text, attempts=3):
         try:
             with urllib.request.urlopen(url, timeout=25) as r:
                 body = r.read().decode(errors="replace")
+            if verbose:
+                log(f"   CallMeBot raw response (attempt {i}): {body.strip().replace(chr(10), ' ')[:400]}")
             if any(x in body.lower() for x in ("message queued", "message sent", "successfully")):
                 return True
             # CallMeBot returns HTTP 200 with a human-readable error IN THE BODY when
@@ -657,7 +665,8 @@ def main():
         delays = "on" if aerodatabox_configured() else "off (no AeroDataBox key yet)"
         ok = notify("✅ <b>Flight monitor test</b> — alerts are wired up.\n"
                     f"Delay/gate/cancellation alerts: {delays}.\n"
-                    "You'll get ⏰ reminder, 🕒 delays, 🚪 gate changes, 🛫 departure, 🛬 landing.")
+                    "You'll get ⏰ reminder, 🕒 delays, 🚪 gate changes, 🛫 departure, 🛬 landing.",
+                    verbose=True)
         print(f"Test alert via '{ch}':", "OK" if ok else "FAILED (see monitor.log / check secrets)")
         return
 
