@@ -19,8 +19,16 @@ on:
     # keeps exactly one alive, so this cron is really a handoff/watchdog tick —
     # while a job is running the new run just waits and starts the instant the
     # old one exits (no window boundary to fall through), and if a job ever
-    # dies the next tick revives it within ~30 min.
-    - cron: "*/30 * * * *"
+    # dies the next tick revives it.
+    #
+    # Deliberately far more frequent than the handoff needs: GitHub's scheduler
+    # is best-effort and silently drops ticks under load (observed here — five
+    # consecutive hourly ticks never fired). Every tick is a fresh chance to
+    # queue the successor, so a dense schedule is what makes the handoff
+    # survive that. Ticks arriving while a job runs cost nothing: they queue,
+    # and each is superseded by the next, which is why the Actions tab shows a
+    # stream of "cancelled" runs. That is the mechanism working, not failing.
+    - cron: "*/10 * * * *"
 
 permissions:
   contents: read
