@@ -28,6 +28,7 @@ Modes:
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -581,17 +582,22 @@ def fr24_live_eta(api, f):
     """FlightRadar24's own running arrival estimate (UTC), or None.
 
     The live feed row carries only position; the details endpoint is what
-    exposes the estimate that actually moves as the aircraft speeds up, slows
-    down or reroutes. Any failure returns None so callers fall back quietly.
+    exposes the estimate that moves as the aircraft speeds up or reroutes.
+    Failures return None, but they say why first — swallowing them silently
+    made an earlier outage of this path impossible to diagnose after the fact.
     """
     try:
         d = api.get_flight_details(f)
     except Exception as e:
-        log(f"   FR24 details error: {e}")
+        log(f"   FR24 details error for {getattr(f, 'id', '?')}: {type(e).__name__}: {e}")
         return None
     if not isinstance(d, dict):
+        log(f"   FR24 details: unexpected payload type {type(d).__name__}")
         return None
-    times = d.get("time") or {}
+    times = d.get("time")
+    if not isinstance(times, dict):
+        log(f"   FR24 details: no 'time' block (keys: {sorted(d)[:8]})")
+        return None
     for group, field in (("estimated", "arrival"), ("other", "eta"), ("real", "arrival")):
         node = times.get(group)
         ts = node.get(field) if isinstance(node, dict) else None
@@ -600,7 +606,51 @@ def fr24_live_eta(api, f):
                 return datetime.fromtimestamp(int(ts), tz=timezone.utc)
             except Exception:
                 continue
+    log(f"   FR24 details: no arrival estimate yet (time groups: {sorted(times)})")
     return None
+
+
+def _haversine_nm(lat1, lon1, lat2, lon2):
+    r = 3440.065  # earth radius in nautical miles
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _dest_coords(api, fl, st):
+    """Destination lat/lon, looked up once and cached in state."""
+    cache = st.setdefault(fl["id"] + "#fr24", {})
+    if cache.get("dest_lat") is not None:
+        return cache["dest_lat"], cache["dest_lon"]
+    try:
+        ap = api.get_airport(fl["dest_iata"])
+        lat = float(getattr(ap, "latitude", None))
+        lon = float(getattr(ap, "longitude", None))
+    except Exception as e:
+        log(f"   airport lookup failed for {fl['dest_iata']}: {type(e).__name__}: {e}")
+        return None, None
+    cache["dest_lat"], cache["dest_lon"] = lat, lon
+    return lat, lon
+
+
+def position_eta(api, fl, st, now, f):
+    """ETA from distance-to-run over ground speed.
+
+    Independent of the details endpoint, and recomputed from the position we
+    already fetch each poll — so the estimate keeps moving even when FR24
+    publishes no arrival time of its own.
+    """
+    gs = getattr(f, "ground_speed", 0) or 0
+    lat, lon = getattr(f, "latitude", None), getattr(f, "longitude", None)
+    if gs < 100 or lat is None or lon is None:
+        return None                      # taxiing, or no usable fix
+    dlat, dlon = _dest_coords(api, fl, st)
+    if dlat is None:
+        return None
+    nm = _haversine_nm(lat, lon, dlat, dlon)
+    # Add a little for descent, approach and taxi-in, which cruise speed overstates.
+    return now + timedelta(hours=nm / gs) + timedelta(minutes=12)
 
 
 def refresh_live_eta(api, fl, st, header, home_tz, now, f):
@@ -615,9 +665,16 @@ def refresh_live_eta(api, fl, st, header, home_tz, now, f):
             pass
     ss["polled_utc"] = now.isoformat()
     eta = fr24_live_eta(api, f)
+    source = "FlightRadar24 estimate"
+    if eta is None:
+        # FR24 does not publish an arrival time for every flight, so fall back
+        # to one we can compute ourselves from the position we already have.
+        eta = position_eta(api, fl, st, now, f)
+        source = "distance/ground-speed estimate"
     if eta is None:
         return
     ss["eta_utc"] = eta.isoformat()
+    ss["eta_source"] = source
 
     # Compare against what the user was last told to expect — the previous
     # announced ETA, or the printed schedule if nothing has been announced yet.
@@ -635,7 +692,7 @@ def refresh_live_eta(api, fl, st, header, home_tz, now, f):
     notify(f"{header}\n\n🕒 <b>Arrival time updated</b>\n"
            f"Now landing {local_and_home(eta, fl['dest_tz'], home_tz)}\n"
            f"~{hhmm(abs(shift))} {'later' if shift > 0 else 'earlier'} than the last estimate\n"
-           f"<i>live FlightRadar24 estimate</i>")
+           f"<i>{ss.get('eta_source', 'live estimate')}</i>")
     log(f"   >> ETA shift alert for {fl['number']} ({shift:+.0f} min)")
 
 
