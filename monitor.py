@@ -575,19 +575,35 @@ def _eta_and_note(fl, st):
             eta = datetime.fromisoformat(ss["eta_utc"])
         except Exception:
             eta = None
-    if eta is None:
-        eta = fl["_arr_utc"]
-        return eta, "as scheduled"
-    delta = ss.get("arr_delta_min")
-    if delta is None:
-        note = "on schedule"
-    elif delta <= -10:
-        note = f"~{abs(delta)} min ahead of schedule"
-    elif delta >= 15:
-        note = f"running ~{hhmm(delta)} late"
-    else:
-        note = "on schedule"
-    return eta, note
+    if eta is not None:
+        delta = ss.get("arr_delta_min")
+        if delta is None:
+            note = "on schedule"
+        elif delta <= -10:
+            note = f"~{abs(delta)} min ahead of schedule"
+        elif delta >= 15:
+            note = f"running ~{hhmm(delta)} late"
+        else:
+            note = "on schedule"
+        return eta, note
+
+    # No live status feed (no AeroDataBox key, or it is failing). Returning the
+    # printed schedule labelled "as scheduled" asserts on-time with no evidence
+    # — and after a late push-back it is simply wrong, which also drags the
+    # landing heuristics early because they key off this ETA. If departure was
+    # actually observed, project from it and say plainly that it is an estimate.
+    s = st.get(fl["id"], {})
+    if s.get("departed_utc"):
+        try:
+            dep = datetime.fromisoformat(s["departed_utc"])
+            eta = dep + (fl["_arr_utc"] - fl["_dep_utc"])
+            late = round((dep - fl["_dep_utc"]).total_seconds() / 60)
+            if late >= 15:
+                return eta, f"estimated · departed ~{hhmm(late)} late (no live status feed)"
+            return eta, "estimated from actual departure (no live status feed)"
+        except Exception:
+            pass
+    return fl["_arr_utc"], "scheduled time — no live status feed"
 
 
 def process_progress(fl, s, st, header, home_tz, now, alt, spd):
