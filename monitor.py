@@ -39,6 +39,7 @@ from zoneinfo import ZoneInfo
 
 import urllib.request
 import urllib.parse
+import urllib.error
 
 BASE = Path(__file__).resolve().parent
 FLIGHTS_FILE = BASE / "flights.json"
@@ -273,6 +274,36 @@ def find_live_flight(api, fl):
 # --- AeroDataBox status feed (delays / gate / cancellation) -----------------
 def aerodatabox_configured():
     return bool(os.environ.get("AERODATABOX_KEY"))
+
+
+def aerodatabox_health(fl):
+    """Live-probe the AeroDataBox key. Returns (ok, human_readable_reason).
+
+    A key being *present* says nothing about whether it still works — an expired
+    or unsubscribed RapidAPI key answers 403 on every call, silently killing
+    delay/gate/cancellation alerts. --test probes it so the report can't claim
+    a capability the bot does not actually have.
+    """
+    if not aerodatabox_configured():
+        return False, "off (no AeroDataBox key set)"
+    key = os.environ.get("AERODATABOX_KEY")
+    date = fl["sched_departure_local"].split(" ")[0]
+    num = urllib.parse.quote(fl["number"])
+    req = urllib.request.Request(
+        f"https://aerodatabox.p.rapidapi.com/flights/number/{num}/{date}"
+        f"?withAircraftImage=false&withLocation=false",
+        headers={"X-RapidAPI-Key": key, "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            r.read()
+        return True, "on (key verified)"
+    except urllib.error.HTTPError as e:
+        hint = {401: "key rejected", 403: "key rejected / not subscribed",
+                429: "quota exhausted"}.get(e.code, f"HTTP {e.code}")
+        return False, f"OFF — {hint} (HTTP {e.code}). Delay/gate/cancellation alerts will NOT fire."
+    except Exception as e:
+        return False, f"unreachable ({e}). Delay/gate/cancellation alerts may not fire."
 
 
 def _adb_time(obj):
@@ -679,10 +710,15 @@ def main():
     if "--test" in sys.argv or "--test-telegram" in sys.argv:
         ch = os.environ.get("NOTIFY_CHANNEL") or ("whatsapp" if os.environ.get("WHATSAPP_APIKEY")
                                                   else "telegram" if os.environ.get("TELEGRAM_BOT_TOKEN") else "none")
-        delays = "on" if aerodatabox_configured() else "off (no AeroDataBox key yet)"
+        # Probe the real API rather than trusting that a key exists.
+        adb_ok, delays = (aerodatabox_health(data["flights"][0]) if data.get("flights")
+                          else (aerodatabox_configured(), "unknown (no flights configured)"))
+        active = "⏰ reminder, 🛫 departure, 🛬 landing, en-route updates"
+        if adb_ok:
+            active += ", 🕒 delays, 🚪 gate changes, 🛑 cancellations"
         ok = notify("✅ <b>Flight monitor test</b> — alerts are wired up.\n"
-                    f"Delay/gate/cancellation alerts: {delays}.\n"
-                    "You'll get ⏰ reminder, 🕒 delays, 🚪 gate changes, 🛫 departure, 🛬 landing.",
+                    f"Delay/gate/cancellation alerts: {delays}\n"
+                    f"You'll get: {active}.",
                     verbose=True)
         print(f"Test alert via '{ch}':", "OK" if ok else "FAILED (see monitor.log / check secrets)")
         return
