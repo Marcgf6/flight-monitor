@@ -1,0 +1,6 @@
+interface:
+  display_name: "Flight Monitor"
+  short_description: "Repo-specific patterns and workflows for flight-monitor"
+  default_prompt: "Use the flight-monitor repo skill to follow existing architecture, testing, and workflow conventions."
+policy:
+  allow_implicit_invocation: true

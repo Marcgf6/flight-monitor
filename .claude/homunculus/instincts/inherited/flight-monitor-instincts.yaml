@@ -1,0 +1,322 @@
+# Instincts generated from https://github.com/Marcgf6/flight-monitor
+# Generated: 2026-07-31T05:42:26.329Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: flight-monitor-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Marcgf6/flight-monitor
+---
+
+# Flight Monitor Commit Length
+
+## Action
+
+Write moderate-length commit messages (~61 characters)
+
+## Evidence
+
+- Average commit message length: 61 chars
+- Based on 3 commits
+
+---
+id: flight-monitor-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Marcgf6/flight-monitor
+---
+
+# Flight Monitor Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: flight-monitor-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Marcgf6/flight-monitor
+---
+
+# Flight Monitor Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: flight-monitor-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Marcgf6/flight-monitor
+---
+
+# Flight Monitor Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: flight-monitor-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Marcgf6/flight-monitor
+---
+
+# Flight Monitor Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: flight-monitor-workflow-single-file-feature-enhancement-monitor-py
+trigger: "when doing single file feature enhancement monitor py"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Marcgf6/flight-monitor
+---
+
+# Flight Monitor Workflow Single File Feature Enhancement Monitor Py
+
+## Action
+
+Follow the single-file-feature-enhancement-monitor-py workflow:
+1. Edit monitor.py to implement new logic or endpoints.
+2. Test the new or improved feature.
+3. Commit changes with a detailed message describing the enhancement.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: monitor.py
+
+---
+id: flight-monitor-instinct-file-naming
+trigger: "When creating a new Python file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Marcgf6/flight-monitor
+---
+
+# Flight Monitor Instinct File Naming
+
+## Action
+
+Name the file using camelCase (e.g., monitorPy.py)
+
+## Evidence
+
+- Pattern in namingConventions.files
+
+---
+id: flight-monitor-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Marcgf6/flight-monitor
+---
+
+# Flight Monitor Instinct Function Naming
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in namingConventions.functions
+
+---
+id: flight-monitor-instinct-class-naming
+trigger: "When defining a new class"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Marcgf6/flight-monitor
+---
+
+# Flight Monitor Instinct Class Naming
+
+## Action
+
+Use PascalCase for class names
+
+## Evidence
+
+- Pattern in namingConventions.classes
+
+---
+id: flight-monitor-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Marcgf6/flight-monitor
+---
+
+# Flight Monitor Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in namingConventions.constants
+
+---
+id: flight-monitor-instinct-import-style
+trigger: "When importing modules within the package"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Marcgf6/flight-monitor
+---
+
+# Flight Monitor Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in importStyle
+
+---
+id: flight-monitor-instinct-export-style
+trigger: "When exporting functions or classes"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: Marcgf6/flight-monitor
+---
+
+# Flight Monitor Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle
+
+---
+id: flight-monitor-instinct-test-location
+trigger: "When writing tests for new or existing features"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: Marcgf6/flight-monitor
+---
+
+# Flight Monitor Instinct Test Location
+
+## Action
+
+Place tests in a separate test folder, not mixed with source files
+
+## Evidence
+
+- Pattern in architecture.testLocation
+
+---
+id: flight-monitor-instinct-test-after-feature
+trigger: "When implementing or improving a feature in monitor.py"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: Marcgf6/flight-monitor
+---
+
+# Flight Monitor Instinct Test After Feature
+
+## Action
+
+Write and run tests for the new or improved feature before committing
+
+## Evidence
+
+- Workflow step: Test the new or improved feature.
+
+---
+id: flight-monitor-instinct-commit-format
+trigger: "When making a commit"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: Marcgf6/flight-monitor
+---
+
+# Flight Monitor Instinct Commit Format
+
+## Action
+
+Write a detailed, freeform commit message describing the enhancement or fix
+
+## Evidence
+
+- Pattern in commits: freeform, detailed messages
+- Examples: 'Make --test report AeroDataBox health honestly instead of assuming'
+
+---
+id: flight-monitor-instinct-feature-enhancement-monitor-py
+trigger: "When someone wants to add or improve a core monitoring or bot feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Marcgf6/flight-monitor
+---
+
+# Flight Monitor Instinct Feature Enhancement Monitor Py
+
+## Action
+
+Edit monitor.py to implement new logic or endpoints, test the changes, and commit with a detailed message
+
+## Evidence
+
+- Workflow: single-file-feature-enhancement-monitor-py
+- Commit examples: 'Answer /status and /where texted to the Telegram bot'
+
