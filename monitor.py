@@ -85,6 +85,13 @@ APPROACH_BEFORE_ARR_MIN = 45             # send an "on approach / descending" up
 # instead of being frozen at whatever was known when it took off.
 FR24_ETA_POLL_SEC = 300          # refresh the live ETA this often (an extra request, so not every poll)
 ETA_SHIFT_ALERT_MIN = 15         # tell the user when the arrival time moves by at least this much
+
+# Third-party status provider. Host is configurable because a marketplace
+# listing moving hosts must not require a code change to recover from.
+ADB_HOST = os.environ.get("AERODATABOX_HOST", "aerodatabox.p.rapidapi.com")
+PROVIDER_ALERT_AFTER_FAILS = 3   # consecutive failures before the operator is told
+PROVIDER_BACKOFF_START_SEC = 900   # first back-off after a failure (doubles thereafter)
+PROVIDER_BACKOFF_MAX_SEC = 21600   # never wait longer than 6h before retrying
 # ---------------------------------------------------------------------------
 
 
@@ -338,25 +345,109 @@ def _adb_time(obj):
         return None
 
 
-def fetch_flight_status(fl):
-    """Return a parsed status dict for this leg from AeroDataBox, or None."""
+def http_error_detail(e):
+    """Status code plus the body the provider sent explaining it.
+
+    RapidAPI answers 403 with a JSON message that distinguishes
+    "not subscribed to this API" from "quota exceeded" from a bad key. Logging
+    only the status code turns a five-second fix into repeated guesswork.
+    """
+    code = getattr(e, "code", None)
+    body = ""
+    try:
+        body = re.sub(r"\s+", " ", e.read().decode(errors="replace")).strip()[:280]
+    except Exception:
+        pass
+    return f"HTTP {code}" + (f" — {body}" if body else "")
+
+
+# --- third-party provider health -------------------------------------------
+# A provider that is down should be noticed once, backed off from, and
+# announced when it recovers — not retried every cycle forever while the
+# capability it powers silently does nothing.
+def _health(st, name):
+    return st.setdefault("_health", {}).setdefault(name, {"fails": 0})
+
+
+def provider_in_backoff(st, name, now):
+    nxt = _health(st, name).get("next_try_utc")
+    if not nxt:
+        return False
+    try:
+        return now < datetime.fromisoformat(nxt)
+    except Exception:
+        return False
+
+
+def provider_failed(st, name, label, reason, now):
+    h = _health(st, name)
+    h["fails"] = h.get("fails", 0) + 1
+    h["last_error"] = reason
+    h["last_error_utc"] = now.isoformat()
+    wait = min(PROVIDER_BACKOFF_MAX_SEC,
+               PROVIDER_BACKOFF_START_SEC * (2 ** (h["fails"] - 1)))
+    h["next_try_utc"] = (now + timedelta(seconds=wait)).isoformat()
+    log(f"   {label} unavailable ({h['fails']}x): {reason} — retrying in {hhmm(wait / 60)}")
+    if h["fails"] >= PROVIDER_ALERT_AFTER_FAILS and not h.get("notified"):
+        h["notified"] = True
+        notify(f"⚠️ <b>{label} unavailable</b>\n{reason}\n\n"
+               f"Delay, gate and cancellation alerts are paused until this is fixed.\n"
+               f"Departure, landing and en-route updates are unaffected.")
+
+
+def provider_recovered(st, name, label):
+    h = _health(st, name)
+    if h.get("notified"):
+        h["notified"] = False
+        notify(f"✅ <b>{label} restored</b>\nDelay, gate and cancellation alerts are live again.")
+        log(f"   {label} recovered")
+    h["fails"] = 0
+    h["next_try_utc"] = None
+    h["last_error"] = None
+
+
+def provider_down_note(st):
+    """One-line degradation notice for the status reply, or ''."""
+    h = _health(st, "aerodatabox")
+    if h.get("fails", 0) < PROVIDER_ALERT_AFTER_FAILS:
+        return ""
+    return ("⚠️ <i>Delay, gate and cancellation alerts are unavailable — "
+            f"{h.get('last_error', 'status provider down')}</i>")
+
+
+def fetch_flight_status(fl, st=None, now=None):
+    """Parsed status for this leg from AeroDataBox, or None.
+
+    Tracks provider health so a persistent failure backs off, is announced
+    once, and is visible in the status reply instead of quietly removing a
+    whole category of alerts.
+    """
     key = os.environ.get("AERODATABOX_KEY")
     if not key:
         return None
+    st = {} if st is None else st
+    now = now or datetime.now(timezone.utc)
+    if provider_in_backoff(st, "aerodatabox", now):
+        return None
     date = fl["sched_departure_local"].split(" ")[0]  # YYYY-MM-DD
     num = urllib.parse.quote(fl["number"])
-    url = (f"https://aerodatabox.p.rapidapi.com/flights/number/{num}/{date}"
+    url = (f"https://{ADB_HOST}/flights/number/{num}/{date}"
            f"?withAircraftImage=false&withLocation=false")
     req = urllib.request.Request(url, headers={
         "X-RapidAPI-Key": key,
-        "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com",
+        "X-RapidAPI-Host": ADB_HOST,
     })
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
             data = json.loads(r.read().decode())
-    except Exception as e:
-        log(f"   AeroDataBox error for {fl['number']}: {e}")
+    except urllib.error.HTTPError as e:
+        provider_failed(st, "aerodatabox", "AeroDataBox", http_error_detail(e), now)
         return None
+    except Exception as e:
+        provider_failed(st, "aerodatabox", "AeroDataBox",
+                        f"{type(e).__name__}: {e}", now)
+        return None
+    provider_recovered(st, "aerodatabox", "AeroDataBox")
     items = data if isinstance(data, list) else (data.get("flights") if isinstance(data, dict) else None)
     if not items:
         return None
@@ -399,7 +490,7 @@ def process_status(fl, st, home_tz, now):
         except Exception:
             pass
 
-    info = fetch_flight_status(fl)
+    info = fetch_flight_status(fl, st, now)
     s["last_check"] = now.isoformat()
     if not info:
         save_state(st)
@@ -966,6 +1057,9 @@ def build_status_text(api, data, st, now, live=False, only=None):
             togo = (fl["_dep_utc"] - now).total_seconds() / 60
             if togo > 0:
                 lines.append(f"in ~{human_duration(togo)}")
+    degraded = provider_down_note(st)
+    if degraded:
+        lines.append("\n" + degraded)
     hidden = len(all_flights) - len(flights)
     if hidden > 0:
         lines.append(f"\n<i>+{hidden} other leg{'s' if hidden > 1 else ''} — "
