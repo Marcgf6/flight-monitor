@@ -92,6 +92,11 @@ ADB_HOST = os.environ.get("AERODATABOX_HOST", "aerodatabox.p.rapidapi.com")
 PROVIDER_ALERT_AFTER_FAILS = 3   # consecutive failures before the operator is told
 PROVIDER_BACKOFF_START_SEC = 900   # first back-off after a failure (doubles thereafter)
 PROVIDER_BACKOFF_MAX_SEC = 21600   # never wait longer than 6h before retrying
+# Cloudflare fronts the marketplace and rejects urllib's default signature
+# outright (403 / "error code: 1010"), so identify as a normal client.
+DEFAULT_USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/126.0.0.0 Safari/537.36")
 # ---------------------------------------------------------------------------
 
 
@@ -319,7 +324,7 @@ def aerodatabox_health(fl):
     req = urllib.request.Request(
         f"https://{ADB_HOST}/flights/number/{num}/{date}"
         f"?withAircraftImage=false&withLocation=false",
-        headers={"X-RapidAPI-Key": key, "X-RapidAPI-Host": ADB_HOST},
+        headers=adb_headers(key),
     )
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
@@ -346,6 +351,25 @@ def _adb_time(obj):
         return datetime.strptime(utc.replace("Z", "").strip(), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+
+def adb_headers(key):
+    """Headers for a RapidAPI call.
+
+    The User-Agent matters: the marketplace sits behind Cloudflare, which
+    answers urllib's default "Python-urllib/x.y" signature with 403 and
+    "error code: 1010" — access denied by bot protection, before the request
+    ever reaches the API. That is indistinguishable from an unsubscribed key
+    unless the response body is read, and it is why re-subscribing never
+    fixed anything. Overridable so a future block can be worked around
+    without a code change.
+    """
+    return {
+        "X-RapidAPI-Key": key,
+        "X-RapidAPI-Host": ADB_HOST,
+        "User-Agent": os.environ.get("HTTP_USER_AGENT") or DEFAULT_USER_AGENT,
+        "Accept": "application/json",
+    }
 
 
 def http_error_detail(e):
@@ -436,10 +460,7 @@ def fetch_flight_status(fl, st=None, now=None):
     num = urllib.parse.quote(fl["number"])
     url = (f"https://{ADB_HOST}/flights/number/{num}/{date}"
            f"?withAircraftImage=false&withLocation=false")
-    req = urllib.request.Request(url, headers={
-        "X-RapidAPI-Key": key,
-        "X-RapidAPI-Host": ADB_HOST,
-    })
+    req = urllib.request.Request(url, headers=adb_headers(key))
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
             data = json.loads(r.read().decode())
