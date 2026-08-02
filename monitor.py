@@ -1115,6 +1115,10 @@ def main():
         # Probe the real API rather than trusting that a key exists.
         adb_ok, delays = (aerodatabox_health(data["flights"][0]) if data.get("flights")
                           else (aerodatabox_configured(), "unknown (no flights configured)"))
+        # Also log it: the verdict used to exist only inside the message sent to
+        # the phone, so whoever ran the test could not see the result without
+        # asking the traveller to read it back.
+        log(f"   AeroDataBox health: {delays}")
         active = "⏰ reminder, 🛫 departure, 🛬 landing, en-route updates"
         if adb_ok:
             active += ", 🕒 delays, 🚪 gate changes, 🛑 cancellations"
