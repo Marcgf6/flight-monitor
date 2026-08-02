@@ -66,6 +66,11 @@ WINDOW_AFTER_ARR_HRS = 4         # keep position-watching this long after arriva
 PREDEP_REMINDER_MIN = 30         # "departs soon" reminder this long before departure
 MISSING_POLLS_FOR_LANDING = 3    # consecutive "gone from feed" polls before a radar-drop can mean landed
 MIN_ELAPSED_FRAC_FOR_RADAR_LAND = 0.85  # a radar-drop landing also requires >= this much of the flight elapsed
+# When the airline feed is silent there is nothing to corroborate a radar
+# dropout, so the bar rises rather than falls: almost the whole flight elapsed,
+# and a much longer silence, before anything is inferred.
+MISSING_POLLS_NO_STATUS = 10
+MIN_ELAPSED_FRAC_NO_STATUS = 0.98
 AIRBORNE_MIN_ALT_FT = 1000       # altitude above which we consider it truly flying
 
 STATUS_BEFORE_DEP_HRS = 10       # start status-watching (delays/gate) this long before dep
@@ -671,7 +676,9 @@ def process_flight(api, fl, st, home_tz, now):
                 log("!! live ETA error:\n" + traceback.format_exc())
             process_progress(fl, s, st, header, home_tz, now, alt, spd)
         elif (on_ground and s["seen_airborne"] and _near_arrival(fl, st, now)
-              and not _status_says_enroute(fl, st)):
+              and status_confidence(fl, st) != "enroute"):
+            # Actually observed on the ground near the destination — an
+            # observation, not an inference, so this one is confirmed.
             _fire_landing(fl, s, header, home_tz, now, "on-ground near destination")
     else:
         if s["seen_airborne"] and s["phase"] == "AIRBORNE":
@@ -683,12 +690,25 @@ def process_flight(api, fl, st, home_tz, now):
             # Otherwise it's a coverage gap over remote airspace — NOT a landing.
             near = _near_arrival(fl, st, now)
             frac = _elapsed_frac(fl, s, st, now)
-            enroute = _status_says_enroute(fl, st)
-            allow = (near and frac >= MIN_ELAPSED_FRAC_FOR_RADAR_LAND and not enroute)
-            log(f"   {fl['number']}: not in feed ({s['missing_polls']}/{MISSING_POLLS_FOR_LANDING}) "
-                f"near_arrival={near} elapsed={frac:.0%} enroute={enroute} allow_land={allow}")
-            if allow and s["missing_polls"] >= MISSING_POLLS_FOR_LANDING:
-                _fire_landing(fl, s, header, home_tz, now, "dropped off radar near destination")
+            conf = status_confidence(fl, st)
+            if conf == "enroute":
+                # The airline says it is still flying. Radar silence means a
+                # coverage gap, nothing more.
+                allow, need = False, MISSING_POLLS_FOR_LANDING
+            elif conf == "arrived":
+                allow, need = True, MISSING_POLLS_FOR_LANDING
+            else:
+                # No corroboration available. Require nearly the whole flight to
+                # have elapsed and a much longer silence before inferring
+                # anything, and mark the result unconfirmed so it can self-heal.
+                allow = near and frac >= MIN_ELAPSED_FRAC_NO_STATUS
+                need = MISSING_POLLS_NO_STATUS
+            log(f"   {fl['number']}: not in feed ({s['missing_polls']}/{need}) "
+                f"near_arrival={near} elapsed={frac:.0%} status={conf} allow_land={allow}")
+            if allow and s["missing_polls"] >= need:
+                _fire_landing(fl, s, header, home_tz, now,
+                              "dropped off radar near destination",
+                              confirmed=(conf == "arrived"))
         else:
             log(f"   {fl['number']}: not airborne yet / not in feed")
 
@@ -921,13 +941,23 @@ _ENROUTE_STATUSES = ("expected", "enroute", "en route", "departed", "boarding",
                      "delayed", "scheduled", "checkin", "check-in", "gate", "active", "airborne")
 
 
-def _status_says_enroute(fl, st):
+def status_confidence(fl, st):
+    """What the airline feed actually asserts: 'arrived', 'enroute' or 'unknown'.
+
+    'unknown' is deliberately not the same as 'enroute is false'. Treating a
+    silent feed as consent is what allowed a radar dropout to be announced as a
+    landing while the aircraft was still flying: the provider was returning 403
+    on every call, so nothing contradicted the guess and it was read as
+    permission. Absence of evidence now demands more evidence, not less.
+    """
     txt = (st.get(fl["id"] + "#status", {}).get("status_text") or "").lower()
     if not txt:
-        return False  # no status info — fall back to the geometric guards
+        return "unknown"
     if "arrived" in txt or "landed" in txt:
-        return False
-    return any(k in txt for k in _ENROUTE_STATUSES)
+        return "arrived"
+    if any(k in txt for k in _ENROUTE_STATUSES):
+        return "enroute"
+    return "unknown"
 
 
 def _elapsed_frac(fl, s, st, now):
@@ -940,18 +970,30 @@ def _elapsed_frac(fl, s, st, now):
     return ((now - departed).total_seconds() / total) if total > 0 else 1.0
 
 
-def _fire_landing(fl, s, header, home_tz, now, reason):
+def _fire_landing(fl, s, header, home_tz, now, reason, confirmed=True):
+    """Announce a landing.
+
+    `confirmed` must be False when the landing was inferred rather than
+    observed. It used to be set True unconditionally, which silently disabled
+    the self-heal that exists precisely to walk back a wrong guess — and made a
+    radar-dropout inference indistinguishable from an airline confirmation.
+    """
     if s["landed_alert"]:
         return
     s["phase"] = "LANDED"
     s["landed_alert"] = True
-    s["landed_confirmed"] = True
+    s["landed_confirmed"] = bool(confirmed)
     delta = round((now - fl["_arr_utc"]).total_seconds() / 60)
     punct = f"{abs(delta)} min early" if delta <= -5 else (f"{delta} min late" if delta >= 15 else "on time")
+    caveat = ("" if confirmed else
+              "\n<i>Inferred from loss of radar contact — not yet confirmed by "
+              "the airline feed. I'll correct this if it turns out to still be flying.</i>")
     notify(f"{header}\n\n🛬 <b>LANDED</b> at {fl['dest_name']}\n"
            f"Time: {local_and_home(now, fl['dest_tz'], home_tz)}\n"
-           f"Scheduled: {local_and_home(fl['_arr_utc'], fl['dest_tz'], home_tz)} ({punct})")
-    log(f"   >> LANDING alert sent for {fl['number']} ({reason})")
+           f"Scheduled: {local_and_home(fl['_arr_utc'], fl['dest_tz'], home_tz)} ({punct})"
+           f"{caveat}")
+    log(f"   >> LANDING alert sent for {fl['number']} ({reason}, "
+        f"{'confirmed' if confirmed else 'UNCONFIRMED'})")
 
 
 # --- inbound Telegram commands (ask the bot for a live update) --------------
