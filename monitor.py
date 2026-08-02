@@ -317,20 +317,23 @@ def aerodatabox_health(fl):
     date = fl["sched_departure_local"].split(" ")[0]
     num = urllib.parse.quote(fl["number"])
     req = urllib.request.Request(
-        f"https://aerodatabox.p.rapidapi.com/flights/number/{num}/{date}"
+        f"https://{ADB_HOST}/flights/number/{num}/{date}"
         f"?withAircraftImage=false&withLocation=false",
-        headers={"X-RapidAPI-Key": key, "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com"},
+        headers={"X-RapidAPI-Key": key, "X-RapidAPI-Host": ADB_HOST},
     )
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
             r.read()
-        return True, "on (key verified)"
+        return True, f"on (key verified against {ADB_HOST})"
     except urllib.error.HTTPError as e:
-        hint = {401: "key rejected", 403: "key rejected / not subscribed",
-                429: "quota exhausted"}.get(e.code, f"HTTP {e.code}")
-        return False, f"OFF — {hint} (HTTP {e.code}). Delay/gate/cancellation alerts will NOT fire."
+        # Report what the provider said, not a guess mapped from the status
+        # code: "not subscribed", "quota exceeded" and "invalid key" all arrive
+        # as 403 and have entirely different fixes.
+        return False, (f"OFF — {http_error_detail(e)} [host {ADB_HOST}]. "
+                       f"Delay/gate/cancellation alerts will NOT fire.")
     except Exception as e:
-        return False, f"unreachable ({e}). Delay/gate/cancellation alerts may not fire."
+        return False, (f"unreachable ({type(e).__name__}: {e}) [host {ADB_HOST}]. "
+                       f"Delay/gate/cancellation alerts may not fire.")
 
 
 def _adb_time(obj):
