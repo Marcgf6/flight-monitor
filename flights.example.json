@@ -1,5 +1,6 @@
 {
   "_comment": "SAMPLE ONLY. Real flights are provided at runtime via the FLIGHTS_JSON secret (cloud) or a local flights.json (dev). Copy this to flights.json and edit for local use.",
+  "_times": "sched_departure_local is the clock time at the DEPARTURE airport and sched_arrival_local the clock time at the ARRIVAL airport — never your own timezone. Getting this wrong shifts every alert by the offset and looks perfectly plausible; the bot cross-checks against the airline schedule and corrects itself, but it can only do that once it can reach the flight.",
   "passenger": "Jane Traveler",
   "booking": "0000000000000000",
   "home_tz": "Europe/Madrid",

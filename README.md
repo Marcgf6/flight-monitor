@@ -11,6 +11,7 @@ Near-real-time flight alerts over WhatsApp, running entirely in GitHub Actions
 | 🛑 cancellation / diversion | AeroDataBox |
 | 🛫 departed (airborne) | FlightRadar24 live feed |
 | 🛬 landed | FlightRadar24 live feed |
+| 🗓 schedule corrected | AeroDataBox (see below) |
 
 You can also **ask** the bot at any time (Telegram):
 
@@ -72,6 +73,25 @@ cadence for free). All personal data and credentials are **encrypted repo secret
 | `FLIGHTS_JSON` | The real itinerary (passenger, booking, flights). Schema: see `flights.example.json`. |
 | `WHATSAPP_PHONE` / `WHATSAPP_APIKEY` | CallMeBot WhatsApp delivery. |
 | `AERODATABOX_KEY` | RapidAPI key for delay/gate/cancellation data (optional — omit and those alerts are skipped). |
+
+## The itinerary is not trusted blindly
+
+`sched_departure_local` is the clock time **at the departure airport** and
+`sched_arrival_local` the clock time **at the arrival airport** — not your own
+timezone. Get that wrong and every window, reminder and ETA shifts by the offset
+while still looking entirely plausible: nothing downstream can tell, because the
+times are wrong *consistently*.
+
+So the bot checks. From 72h before departure it cross-checks the configured
+departure against the airline's schedule every 6h (and on every status poll once
+the window opens). If they disagree by more than 20 minutes the **airline wins**:
+the corrected times are adopted immediately, a pre-departure reminder that fired
+against the wrong time is re-armed, and you get a 🗓 message saying what changed.
+A whole-hour discrepancy is called out as the timezone mistake it almost always is.
+
+The correction is kept in the Actions cache, not written back to the itinerary —
+`FLIGHTS_JSON` is an encrypted secret only its owner can edit, and the bot still
+has to track the real flight in the meantime, including across job handoffs.
 
 ## Changing flights or timing
 
