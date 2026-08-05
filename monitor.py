@@ -88,6 +88,9 @@ DELAY_REALERT_MIN = 15           # re-alert when the delay changes by >= this ma
 ARR_DELAY_ALERT_MIN = 20         # only alert arrival delays >= this many minutes
 
 # Proactive "how's the trip going" updates while airborne (no question needed).
+# A leg that finished today is still what you want to see when you ask. Older
+# than this it becomes history and only "all" shows it.
+RECENT_LEG_HRS = 18
 PROGRESS_FRACTIONS = [0.25, 0.50, 0.75]  # send an en-route update at these points of the flight
 PROGRESS_MIN_DURATION_MIN = 180          # only send milestone updates for flights >= 3h
 APPROACH_BEFORE_ARR_MIN = 45             # send an "on approach / descending" update this long before ETA
@@ -1110,6 +1113,7 @@ def _fire_landing(fl, s, header, home_tz, now, reason, confirmed=True):
     s["phase"] = "LANDED"
     s["landed_alert"] = True
     s["landed_confirmed"] = bool(confirmed)
+    s["landed_utc"] = now.isoformat()
     delta = round((now - fl["_arr_utc"]).total_seconds() / 60)
     punct = f"{abs(delta)} min early" if delta <= -5 else (f"{delta} min late" if delta >= 15 else "on time")
     caveat = ("" if confirmed else
@@ -1193,18 +1197,37 @@ def mentioned_flights(data, text):
     return hits
 
 
-def focus_flights(data, st):
+def _finished_recently(fl, st, now):
+    """A leg that landed within the last RECENT_LEG_HRS. Filtering completed
+    legs out of the default view made a flight that finished hours ago look like
+    it was never in the itinerary at all — the one reading that is never true."""
+    s = st.get(fl["id"], {})
+    if s.get("phase") != "LANDED":
+        return False
+    when = s.get("landed_utc") or s.get("last_seen_utc")
+    if not when:
+        # Landed before landing times were recorded; fall back to the schedule.
+        when = fl["_arr_utc"].isoformat()
+    try:
+        return (now - datetime.fromisoformat(when)) <= timedelta(hours=RECENT_LEG_HRS)
+    except Exception:
+        return False
+
+
+def focus_flights(data, st, now=None):
     """What to show when nothing specific was asked for: whatever is in the air,
-    else the next departure. Printing four legs — three of them weeks out — on
-    every question buries the one answer being looked for."""
+    what just finished, and the next departure. Printing four legs — three of
+    them weeks out — on every question buries the one answer being looked for."""
+    now = now or datetime.now(timezone.utc)
     airborne = [fl for fl in data["flights"]
                 if st.get(fl["id"], {}).get("phase") == "AIRBORNE"]
-    if airborne:
-        return airborne
+    recent = [fl for fl in data["flights"] if _finished_recently(fl, st, now)]
     waiting = sorted((fl for fl in data["flights"]
                       if st.get(fl["id"], {}).get("phase", "WAITING") == "WAITING"),
                      key=lambda f: f["_dep_utc"])
-    return waiting[:1] or data["flights"]
+    picked = recent + airborne + (waiting[:1] if not airborne else [])
+    # Preserve itinerary order, and never answer with nothing.
+    return [fl for fl in data["flights"] if fl in picked] or data["flights"]
 
 
 def build_status_text(api, data, st, now, live=False, only=None):
@@ -1228,7 +1251,15 @@ def build_status_text(api, data, st, now, live=False, only=None):
         if leg:
             lines.append(f"<i>{leg}</i>")
         if phase == "LANDED":
-            lines.append("✅ Landed")
+            when = s.get("landed_utc")
+            if when:
+                try:
+                    lines.append("✅ Landed "
+                                 f"{local_and_home(datetime.fromisoformat(when), fl['dest_tz'], home_tz)}")
+                except Exception:
+                    lines.append("✅ Landed")
+            else:
+                lines.append("✅ Landed")
             continue
         eta, note = _eta_and_note(fl, st)
         if phase == "AIRBORNE":
@@ -1245,11 +1276,18 @@ def build_status_text(api, data, st, now, live=False, only=None):
                 else:
                     lines.append("📍 not in the live radar feed right now")
         else:
-            lines.append(f"⏳ Not departed yet — departs "
-                         f"{local_and_home(fl['_dep_utc'], fl['origin_tz'], home_tz)}")
             togo = (fl["_dep_utc"] - now).total_seconds() / 60
             if togo > 0:
+                lines.append(f"⏳ Not departed yet — departs "
+                             f"{local_and_home(fl['_dep_utc'], fl['origin_tz'], home_tz)}")
                 lines.append(f"in ~{human_duration(togo)}")
+            else:
+                # Scheduled departure has passed with nothing observed. Saying
+                # "not departed yet" here would be a straight falsehood.
+                lines.append(f"❓ No sighting — was due "
+                             f"{local_and_home(fl['_dep_utc'], fl['origin_tz'], home_tz)}, "
+                             f"{human_duration(-togo)} ago")
+                lines.append("<i>Nothing on radar or the airline feed for this leg.</i>")
         if fl.get("_schedule_corrected"):
             lines.append("<i>times from the airline feed — the itinerary had a "
                          "different departure</i>")
@@ -1391,6 +1429,32 @@ def cmd_status(data, st):
     print()
 
 
+def announce_itinerary(data, st):
+    """Confirm the itinerary whenever it changes.
+
+    The flight list lives in an encrypted secret and is read once at startup, so
+    an edit is invisible until something either alerts or doesn't — there was no
+    way to tell a saved change from a lost one except by waiting for a flight to
+    be missed. Say what was loaded, once, when it differs from last time.
+    """
+    sig = [f"{fl['id']}@{fl['_dep_utc'].isoformat()}" for fl in data["flights"]]
+    if st.get("_itinerary_sig") == sig:
+        return
+    first = "_itinerary_sig" not in st
+    st["_itinerary_sig"] = sig
+    save_state(st)
+    log(f"   itinerary: {len(sig)} legs — " + ", ".join(fl["number"] for fl in data["flights"]))
+    title = "Itinerary loaded" if first else "Itinerary updated"
+    lines = [f"📋 <b>{title}</b> — {len(data['flights'])} legs"]
+    for fl in data["flights"]:
+        phase = st.get(fl["id"], {}).get("phase", "WAITING")
+        icon = {"WAITING": "🕐", "AIRBORNE": "🛫", "LANDED": "✅"}.get(phase, "•")
+        route, _ = _leg_parts(fl)
+        lines.append(f"{icon} <b>{fl['number']}</b> {route} — "
+                     f"{local_and_home(fl['_dep_utc'], fl['origin_tz'], data['home_tz'])}")
+    notify("\n".join(lines))
+
+
 def _all_landed(data, st):
     return all(st.get(fl["id"], {}).get("phase") == "LANDED" for fl in data["flights"])
 
@@ -1424,6 +1488,8 @@ def main():
                     verbose=True)
         print(f"Test alert via '{ch}':", "OK" if ok else "FAILED (see monitor.log / check secrets)")
         return
+
+    announce_itinerary(data, st)
 
     from FlightRadar24 import FlightRadar24API
     api = FlightRadar24API()
