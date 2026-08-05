@@ -1180,21 +1180,76 @@ def human_duration(mins):
     return hhmm(mins)
 
 
+# Question vocabulary. A word here is never mistaken for the name of a place
+# the itinerary is missing.
+_ASK_WORDS = {
+    "flight", "flights", "leg", "legs", "trip", "itinerary", "plane", "airport",
+    "status", "where", "when", "what", "which", "does", "done", "long", "till",
+    "until", "time", "times", "much", "many", "next", "last", "this", "that",
+    "there", "here", "have", "been", "with", "from", "about", "into", "still",
+    "schedule", "scheduled", "delay", "delayed", "late", "early", "time",
+    "land", "lands", "landed", "landing", "arrive", "arrives", "arrived",
+    "arrival", "depart", "departs", "departed", "departure", "take", "takes",
+    "off", "going", "gone", "left", "leave", "leaves", "board", "boarding",
+    "gate", "everything", "full", "every", "all", "please", "thanks", "update",
+}
+
+
+def _leg_keys(fl):
+    """Words that identify this leg: flight number and place names."""
+    num = fl["number"].lower()
+    keys = {num, num.replace(" ", ""), "".join(c for c in num if c.isdigit())}
+    route, _ = _leg_parts(fl)
+    for src in (route, fl.get("origin_name", ""), fl.get("dest_name", "")):
+        for word in re.split(r"[^\w]+", src.lower()):
+            if len(word) > 3:              # skip "t1", "→", airport codes
+                keys.add(word)
+    return {k for k in keys if k}
+
+
 def mentioned_flights(data, text):
-    """Legs the message actually refers to, by flight number or place name."""
+    """Legs the message refers to, best match only.
+
+    Scored rather than any-match: "the Hanoi to Da Nang flight" names two
+    places, and a leg matching both endpoints is the answer — not every leg that
+    happens to touch one of them.
+    """
     t = (text or "").lower()
-    hits = []
+    scored = [(sum(1 for k in _leg_keys(fl) if k in t), fl) for fl in data["flights"]]
+    scored = [(n, fl) for n, fl in scored if n]
+    if not scored:
+        return []
+    best = max(n for n, _ in scored)
+    return [fl for n, fl in scored if n == best]
+
+
+def unknown_places(data, text):
+    """Place-like words in the message that match no leg in the itinerary.
+
+    Answering about the legs that happen to share one city, while silently
+    dropping the half of the question that matched nothing, is how "how is the
+    Hanoi–Da Nang flight" comes back as two unrelated Hanoi legs. If a name
+    isn't in the itinerary, say so.
+    """
+    known = set()
     for fl in data["flights"]:
-        num = fl["number"].lower()
-        keys = {num, num.replace(" ", ""), "".join(c for c in num if c.isdigit())}
-        route, _ = _leg_parts(fl)
-        for src in (route, fl.get("origin_name", ""), fl.get("dest_name", "")):
-            for word in re.split(r"[^\w]+", src.lower()):
-                if len(word) > 3:          # skip "t1", "→", airport codes
-                    keys.add(word)
-        if any(k and k in t for k in keys):
-            hits.append(fl)
-    return hits
+        known |= _leg_keys(fl)
+    toks = re.findall(r"\w+", text or "")
+    out = []
+    for i, raw in enumerate(toks):
+        w = raw.lower()
+        if not (len(w) > 3 and w.isalpha() and w not in _ASK_WORDS):
+            continue
+        if any(w in k or k in w for k in known):
+            continue
+        # Carry a short capitalised word back in, so a two-word place name is
+        # quoted whole: "Da Nang", not "Nang".
+        prev = toks[i - 1] if i else ""
+        label = (f"{prev} {raw}" if prev and len(prev) <= 3 and prev[:1].isupper()
+                 and prev.lower() not in _ASK_WORDS else raw)
+        if label not in out:
+            out.append(label)
+    return out
 
 
 def _finished_recently(fl, st, now):
@@ -1302,14 +1357,23 @@ def build_status_text(api, data, st, now, live=False, only=None):
 
 
 def select_flights(data, st, text):
-    """Which legs a message wants: the ones it names, everything if it asks for
-    everything, otherwise just what is actually happening."""
-    named = mentioned_flights(data, text)
-    if named:
-        return named
+    """Which legs a message wants, and what to say about names it used that the
+    itinerary doesn't have. Returns (legs_or_None, note); None == no filtering.
+    """
     if re.search(r"\b(all|everything|full|itinerary|trip|every)\b", (text or "").lower()):
-        return None                     # None == no filtering
-    return focus_flights(data, st)
+        return None, ""
+    named = mentioned_flights(data, text)
+    missing = unknown_places(data, text)
+    note = ""
+    if missing:
+        names = ", ".join(f"“{m}”" for m in missing[:3])
+        if named:
+            note = (f"⚠️ Nothing in the itinerary matches {names} — "
+                    f"answering on what it does match.")
+        else:
+            note = (f"⚠️ I have no leg matching {names}. "
+                    f"Here's where the trip stands instead.")
+    return (named or focus_flights(data, st)), note
 
 
 HELP_TEXT = ("🤖 <b>Flight monitor</b>\n\n"
@@ -1377,9 +1441,10 @@ def handle_incoming(api, data, st, now):
         intent = match_intent(text)
         log(f"   inbound message → intent={intent or 'unrecognised'}")
         if intent in ("status", "live"):
-            only = select_flights(data, st, text)
-            send_telegram(build_status_text(api, data, st, now,
-                                            live=(intent == "live"), only=only))
+            only, note = select_flights(data, st, text)
+            body = build_status_text(api, data, st, now,
+                                     live=(intent == "live"), only=only)
+            send_telegram(f"{note}\n\n{body}" if note else body)
         elif intent == "help":
             send_telegram(HELP_TEXT)
         else:
