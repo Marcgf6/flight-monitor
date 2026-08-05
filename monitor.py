@@ -75,6 +75,12 @@ AIRBORNE_MIN_ALT_FT = 1000       # altitude above which we consider it truly fly
 
 STATUS_BEFORE_DEP_HRS = 10       # start status-watching (delays/gate) this long before dep
 STATUS_AFTER_ARR_HRS = 2         # keep status-watching this long after arrival
+# A hand-entered itinerary can disagree with the airline's own schedule. The
+# airline wins: check well ahead of the status window, cheaply, so a wrong
+# departure time surfaces days early instead of at the gate.
+SCHEDULE_MISMATCH_MIN = 20       # tolerate this much drift before correcting
+SCHEDULE_AUDIT_LEAD_HRS = 72     # start cross-checking the schedule this long before dep
+SCHEDULE_AUDIT_SEC = 21600       # ...and re-check every 6h (12 extra calls per leg, total)
 LANDING_NEAR_ETA_MIN = 45        # a radar dropout only counts as "landed" within this window of ETA
 STATUS_POLL_SEC = 1200           # how often to hit AeroDataBox per flight (20 min → quota-friendly)
 DELAY_ALERT_MIN = 15             # only alert departure delays >= this many minutes
@@ -134,7 +140,35 @@ def load_flights():
         arr = datetime.strptime(fl["sched_arrival_local"], "%Y-%m-%d %H:%M")
         fl["_dep_utc"] = dep.replace(tzinfo=ZoneInfo(fl["origin_tz"])).astimezone(timezone.utc)
         fl["_arr_utc"] = arr.replace(tzinfo=ZoneInfo(fl["dest_tz"])).astimezone(timezone.utc)
+        fl["_config_dep_utc"] = fl["_dep_utc"]
     return data
+
+
+def apply_schedule_overrides(data, st):
+    """Re-apply a schedule correction previously learned from the airline feed.
+
+    The correction lives in state, not in the itinerary, because the itinerary
+    is an encrypted secret that only its owner can edit — the bot still has to
+    track the real flight in the meantime, and across job handoffs.
+    """
+    fixes = st.get("_schedule") or {}
+    for fl in data["flights"]:
+        fix = fixes.get(fl["id"])
+        if not fix:
+            continue
+        try:
+            fl["_dep_utc"] = datetime.fromisoformat(fix["dep_utc"])
+            fl["_arr_utc"] = datetime.fromisoformat(fix["arr_utc"])
+        except Exception:
+            continue
+        fl["_schedule_corrected"] = True
+    return data
+
+
+def lookup_date(fl):
+    """Origin-local date to ask the provider about — derived from the effective
+    departure, so a corrected schedule also corrects which day we look up."""
+    return fl["_dep_utc"].astimezone(ZoneInfo(fl["origin_tz"])).strftime("%Y-%m-%d")
 
 
 def _mark_served_full_term():
@@ -461,7 +495,7 @@ def fetch_flight_status(fl, st=None, now=None):
     now = now or datetime.now(timezone.utc)
     if provider_in_backoff(st, "aerodatabox", now):
         return None
-    date = fl["sched_departure_local"].split(" ")[0]  # YYYY-MM-DD
+    date = lookup_date(fl)
     num = urllib.parse.quote(fl["number"])
     url = (f"https://{ADB_HOST}/flights/number/{num}/{date}"
            f"?withAircraftImage=false&withLocation=false")
@@ -486,10 +520,14 @@ def fetch_flight_status(fl, st=None, now=None):
         if dep_iata == fl["origin_iata"]:
             chosen = it
             break
+    # Whether this is definitely our leg, or a same-numbered flight we fell back
+    # to. Only the former is trustworthy enough to overrule the itinerary.
+    origin_matched = chosen is not None
     chosen = chosen or items[0]
     dep = chosen.get("departure") or {}
     arr = chosen.get("arrival") or {}
     return {
+        "origin_matched": origin_matched,
         "status": (chosen.get("status") or "").strip(),
         "dep_sched": _adb_time(dep.get("scheduledTime")),
         "dep_revised": _adb_time(dep.get("revisedTime") or dep.get("predictedTime") or dep.get("runwayTime")),
@@ -499,6 +537,91 @@ def fetch_flight_status(fl, st=None, now=None):
         "dep_terminal": dep.get("terminal"),
         "arr_airport": (arr.get("airport") or {}).get("iata"),
     }
+
+
+def reconcile_schedule(fl, st, info, home_tz, now):
+    """Let the airline's schedule overrule the configured one.
+
+    A departure typed in the traveller's own timezone rather than the departure
+    airport's shifts every window, reminder and ETA by the offset between them,
+    and nothing downstream can tell: the times look plausible, they are just
+    consistently wrong. The provider knows the real schedule, so adopt it and
+    say what changed. Returns True when a new correction was announced.
+    """
+    sched = info.get("dep_sched")
+    if not sched or not info.get("origin_matched"):
+        return False
+    drift = (sched - fl["_dep_utc"]).total_seconds() / 60
+    if abs(drift) < SCHEDULE_MISMATCH_MIN:
+        return False
+
+    new_dep = sched
+    new_arr = info.get("arr_sched") or (fl["_arr_utc"] + timedelta(minutes=drift))
+    if new_arr <= new_dep:                       # nonsense pair — keep the duration we know
+        new_arr = new_dep + (fl["_arr_utc"] - fl["_dep_utc"])
+    old_dep = fl["_dep_utc"]
+
+    fixes = st.setdefault("_schedule", {})
+    already = (fixes.get(fl["id"]) or {}).get("dep_utc") == new_dep.isoformat()
+    fixes[fl["id"]] = {"dep_utc": new_dep.isoformat(), "arr_utc": new_arr.isoformat(),
+                       "source": "aerodatabox", "applied_utc": now.isoformat()}
+    fl["_dep_utc"], fl["_arr_utc"] = new_dep, new_arr
+    fl["_schedule_corrected"] = True
+    if already:
+        return False
+
+    # A reminder that already fired, fired at the wrong time. Re-arm it.
+    s_pos = st.get(fl["id"])
+    if (s_pos and not s_pos.get("departed_alert")
+            and now < new_dep - timedelta(minutes=PREDEP_REMINDER_MIN)):
+        s_pos["predep_alert"] = False
+
+    # A whole-number-of-hours error is the timezone mistake, not a retimed
+    # flight. Naming it is the difference between a fix and a shrug.
+    cause = ""
+    if abs(drift) >= 45 and min(abs(drift) % 60, 60 - abs(drift) % 60) <= 2:
+        cause = (f"\n\nThat is almost exactly {hhmm(abs(drift))} — the itinerary's time looks "
+                 f"like it was written in another timezone. <code>sched_departure_local</code> "
+                 f"must be local time at {fl['origin_name']}.")
+    notify(f"{_flight_header(fl)}\n\n🗓 <b>Schedule corrected</b>\n"
+           f"The airline has this departing "
+           f"<b>{local_and_home(new_dep, fl['origin_tz'], home_tz)}</b>, not "
+           f"{local_and_home(old_dep, fl['origin_tz'], home_tz)} "
+           f"({'+' if drift > 0 else '−'}{hhmm(abs(drift))}).{cause}\n\n"
+           f"I've switched to the airline's times — reminders, windows and ETAs now "
+           f"follow the real flight.")
+    log(f"   >> SCHEDULE CORRECTION {fl['number']}: {old_dep.isoformat()} -> "
+        f"{new_dep.isoformat()} ({round(drift)}m)")
+    return True
+
+
+def schedule_audit_due(fl, st, now):
+    """Whether to spend a call cross-checking this leg's schedule right now."""
+    if not aerodatabox_configured():
+        return False
+    if not (fl["_dep_utc"] - timedelta(hours=SCHEDULE_AUDIT_LEAD_HRS)
+            <= now <= fl["_arr_utc"] + timedelta(hours=STATUS_AFTER_ARR_HRS)):
+        return False
+    last = (st.get("_schedule_audit") or {}).get(fl["id"])
+    if not last:
+        return True
+    try:
+        return (now - datetime.fromisoformat(last)).total_seconds() >= SCHEDULE_AUDIT_SEC
+    except Exception:
+        return True
+
+
+def audit_schedule(fl, st, home_tz, now):
+    """Cheap standalone schedule check, for the days before the status window
+    opens. Without it a wrong departure time is only noticed once the flight is
+    nearly due — or, if the error is large enough, never, because the windows
+    derived from it never open at the right moment."""
+    info = fetch_flight_status(fl, st, now)
+    st.setdefault("_schedule_audit", {})[fl["id"]] = now.isoformat()
+    if info and not reconcile_schedule(fl, st, info, home_tz, now):
+        log(f"   {fl['number']}: schedule audit — departs "
+            f"{local_and_home(fl['_dep_utc'], fl['origin_tz'], home_tz)}")
+    save_state(st)
 
 
 def process_status(fl, st, home_tz, now):
@@ -524,6 +647,10 @@ def process_status(fl, st, home_tz, now):
     if not info:
         save_state(st)
         return
+    # Before reading anything else off this response: is it even the same flight
+    # the itinerary describes? Everything below is timed off _dep_utc.
+    st.setdefault("_schedule_audit", {})[fl["id"]] = now.isoformat()
+    reconcile_schedule(fl, st, info, home_tz, now)
 
     header = _flight_header(fl)
     status_l = info["status"].lower()
@@ -1123,6 +1250,9 @@ def build_status_text(api, data, st, now, live=False, only=None):
             togo = (fl["_dep_utc"] - now).total_seconds() / 60
             if togo > 0:
                 lines.append(f"in ~{human_duration(togo)}")
+        if fl.get("_schedule_corrected"):
+            lines.append("<i>times from the airline feed — the itinerary had a "
+                         "different departure</i>")
     degraded = provider_down_note(st)
     if degraded:
         lines.append("\n" + degraded)
@@ -1237,6 +1367,11 @@ def poll_cycle(api, data, st, now):
                 process_status(fl, st, home_tz, now)
             except Exception:
                 log("!! status error:\n" + traceback.format_exc())
+        elif schedule_audit_due(fl, st, now):
+            try:
+                audit_schedule(fl, st, home_tz, now)
+            except Exception:
+                log("!! schedule audit error:\n" + traceback.format_exc())
         if in_window(fl, now):
             any_active = True
             process_flight(api, fl, st, home_tz, now)
@@ -1264,6 +1399,7 @@ def main():
     load_env()
     data = load_flights()
     st = load_state()
+    apply_schedule_overrides(data, st)
 
     if "--status" in sys.argv:
         cmd_status(data, st)
